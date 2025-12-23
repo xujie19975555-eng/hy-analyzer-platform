@@ -84,3 +84,13 @@ async def get_trader_trades(
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "service": "hy-analyzer-api"}
+
+
+@router.get("/version")
+async def get_version():
+    """Get API version"""
+    return {
+        "version": "0.1.0",
+        "api": "v1",
+        "name": "HY Analyzer Platform"
+    }
