@@ -55,10 +55,8 @@ async def test_get_trader_stats_valid_address():
         "winRate": 65.0
     }
 
-    with patch("app.api.routes.get_superx_service") as mock_service:
-        mock_instance = AsyncMock()
-        mock_instance.get_trader_stats.return_value = mock_data
-        mock_service.return_value = mock_instance
+    with patch("app.services.hyperliquid.SuperXService.get_trader_stats", new_callable=AsyncMock) as mock_get:
+        mock_get.return_value = mock_data
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -66,6 +64,6 @@ async def test_get_trader_stats_valid_address():
                 "/api/v1/traders/0x6c06bfd51ea8032ddaeea8b69009417b54f3587b/stats"
             )
 
-    assert response.status_code == 200
-    data = response.json()
-    assert data["roe_all_time"] == 100.0
+        assert response.status_code == 200
+        data = response.json()
+        assert data["roe_all_time"] == 100.0
