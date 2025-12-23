@@ -1,0 +1,32 @@
+# Aider configuration for HY Analyzer Platform
+# https://aider.chat/docs/config/aider_conf.html
+
+# Model settings - Use Claude via existing relay
+model: claude-sonnet-4-20250514
+edit-format: diff
+
+# Git settings
+auto-commits: true
+dirty-commits: false
+attribute-author: true
+attribute-committer: true
+commit-prompt: |
+  Write a concise commit message in this format:
+  <type>(<scope>): <description>
+
+  Types: feat, fix, refactor, test, docs, style, chore
+  Keep under 72 chars. No period at end.
+
+# Code settings
+auto-lint: true
+lint-cmd: "cd backend && ruff check --fix"
+auto-test: true
+test-cmd: "cd backend && pytest -x -q"
+
+# Safety
+check-update: false
+no-suggest-shell-commands: true
+
+# UI
+dark-mode: true
+stream: true

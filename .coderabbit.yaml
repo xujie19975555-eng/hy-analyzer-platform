@@ -1,0 +1,43 @@
+# CodeRabbit Configuration
+# https://docs.coderabbit.ai/guides/configure-coderabbit
+
+language: "zh-CN"
+
+reviews:
+  profile: "chill"
+  request_changes_workflow: true
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  auto_review:
+    enabled: true
+    drafts: false
+
+  path_instructions:
+    - path: "backend/**/*.py"
+      instructions: |
+        - 检查类型注解是否完整
+        - 检查是否有潜在的异常未处理
+        - 检查 API 响应格式是否一致
+        - 检查是否有硬编码的配置值
+
+    - path: "backend/tests/**"
+      instructions: |
+        - 检查测试是否覆盖边界条件
+        - 检查 mock 是否正确使用
+        - 检查断言是否足够具体
+
+    - path: "frontend/**/*.vue"
+      instructions: |
+        - 检查组件 props 是否有类型定义
+        - 检查是否有未处理的 loading/error 状态
+        - 检查是否有内存泄漏风险（未清理的监听器）
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  opt_out: false
+  learnings:
+    scope: "auto"
