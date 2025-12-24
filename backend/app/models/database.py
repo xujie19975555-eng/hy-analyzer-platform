@@ -47,6 +47,8 @@ class TraderAnalysis(Base):
     avg_trade_size = Column(Float, nullable=True)
     avg_holding_time = Column(Float, nullable=True)  # seconds
     trade_frequency = Column(Float, nullable=True)  # trades per day
+    trading_days = Column(Integer, nullable=True)  # Days since first trade (survival days)
+    first_trade_date = Column(DateTime, nullable=True)  # Date of first trade
 
     # Backtest results (default 10000 USDT)
     backtest_pnl_7d = Column(Float, nullable=True)
@@ -77,6 +79,7 @@ class TraderAnalysis(Base):
     ai_codex_score = Column(Float, nullable=True)  # Codex/GPT model individual score
     ai_models_used = Column(String(100), nullable=True)  # Comma-separated: "claude,openai"
     ai_trading_tags = Column(String(200), nullable=True)  # Comma-separated trading style tags
+    ai_score_breakdown = Column(JSON, nullable=True)  # Score breakdown items [{item, points, type}]
 
     # Raw data storage
     raw_stats = Column(JSON, nullable=True)
@@ -85,6 +88,10 @@ class TraderAnalysis(Base):
     # Status
     status = Column(String(20), default="pending")  # pending, analyzing, completed, failed
     error_message = Column(Text, nullable=True)
+
+    # Data completeness indicators
+    data_limited = Column(Boolean, default=False)  # True if only 90-day data due to API limits
+    data_coverage_days = Column(Integer, nullable=True)  # Actual days of data coverage
 
 
 class AnalysisQueue(Base):

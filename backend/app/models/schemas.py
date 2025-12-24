@@ -66,14 +66,14 @@ class PnLDataPoint(BaseModel):
 
 class TraderPnLHistory(BaseModel):
     address: str
-    period: str  # "7d", "30d", "90d", "all"
+    period: str
     data_points: list[PnLDataPoint]
 
 
 class TradeRecord(BaseModel):
     time: datetime
     coin: str
-    side: str  # "B" or "A" (buy/sell)
+    side: str
     px: float
     sz: float
     closed_pnl: float
@@ -146,6 +146,14 @@ class BacktestSummary(BaseModel):
     trade_count: int
 
 
+class ScoreBreakdownItem(BaseModel):
+    """Individual scoring factor"""
+
+    item: str = Field(..., description="Description of the scoring factor in Chinese")
+    points: float = Field(..., description="Points added (positive) or deducted (negative)")
+    type: Literal["positive", "negative"] = Field(..., description="Whether this is a bonus or penalty")
+
+
 class AIEvaluation(BaseModel):
     """AI evaluation for copy-trading recommendation"""
 
@@ -156,9 +164,15 @@ class AIEvaluation(BaseModel):
     trading_tags: list[str] = Field(
         default_factory=list, description="Trading style tags like 高频, 中线, 小资金"
     )
+    score_breakdown: list[ScoreBreakdownItem | dict] = Field(
+        default_factory=list, description="Detailed scoring factors (加分/扣分项)"
+    )
     claude_score: float | None = Field(None, ge=0, le=100, description="Claude model score")
     codex_score: float | None = Field(None, ge=0, le=100, description="Codex/GPT model score")
     models_used: list[str] = Field(default_factory=list, description="Models used for evaluation")
+    data_coverage_warning: str | None = Field(
+        None, description="Warning if full history data is incomplete"
+    )
 
 
 class FullAnalysisRequest(BaseModel):
@@ -170,6 +184,20 @@ class FullAnalysisRequest(BaseModel):
     force_refresh: bool = Field(
         default=False, description="Force re-analysis even if cached data exists"
     )
+    use_full_history: bool = Field(
+        default=False, description="For high-frequency traders, fetch full S3 history (slow)"
+    )
+
+
+class HighFrequencyWarning(BaseModel):
+    """Warning when trader has too many fills for quick analysis"""
+
+    address: str
+    fills_90d: int = Field(..., description="Number of fills in 90 days")
+    estimated_all_time: int = Field(..., description="Estimated total fills")
+    requires_s3: bool = Field(..., description="Whether S3 fetch is required")
+    estimated_time_seconds: int = Field(..., description="Estimated time for full fetch")
+    message: str
 
 
 class FullAnalysisResult(BaseModel):
@@ -201,6 +229,14 @@ class FullAnalysisResult(BaseModel):
     avg_holding_time: float | None = None
     trade_frequency: float | None = None
 
+    # Survival days - NEW: Added first_trade_date for better display
+    trading_days: int | None = Field(
+        None, description="Days since first trade (trader survival days / 存活天数)"
+    )
+    first_trade_date: datetime | None = Field(
+        None, description="Date of the first trade (首笔交易日期)"
+    )
+
     # Backtest results
     backtest_7d: BacktestSummary | None = None
     backtest_30d: BacktestSummary | None = None
@@ -210,18 +246,43 @@ class FullAnalysisResult(BaseModel):
     # AI evaluation
     ai_evaluation: AIEvaluation | None = None
 
-    # Status
+    # Status and data coverage
     status: str = "completed"
+    data_limited: bool = Field(
+        default=False, description="True if using 90d data due to API limit"
+    )
+    data_coverage_days: int | None = Field(
+        None, description="Actual number of days of data used"
+    )
+
+    # Computed property for survival time display (like SuperX "1 year")
+    @property
+    def survival_time_display(self) -> str | None:
+        """Return human-readable survival time like '1 year', '6 months', '30 days'"""
+        if self.trading_days is None:
+            return None
+        days = self.trading_days
+        if days >= 365:
+            years = days / 365
+            if years >= 2:
+                return f"{int(years)} years"
+            return "1 year" if years >= 1 else f"{int(days/30)} months"
+        elif days >= 30:
+            months = days / 30
+            return f"{int(months)} months" if months >= 2 else "1 month"
+        else:
+            return f"{days} days"
 
 
 class AnalysisStatus(BaseModel):
     """Status of an ongoing analysis"""
 
     address: str
-    status: Literal["queued", "analyzing", "completed", "failed"]
+    status: Literal["queued", "analyzing", "completed", "failed", "needs_confirmation"]
     progress: int = Field(default=0, ge=0, le=100)
     current_step: str | None = None
     error: str | None = None
+    high_frequency_warning: "HighFrequencyWarning | None" = None
 
 
 class TraderHistoryItem(BaseModel):
@@ -234,6 +295,7 @@ class TraderHistoryItem(BaseModel):
     ai_score: float | None = None
     ai_recommendation: str | None = None
     trading_tags: list[str] = Field(default_factory=list, description="Trading style tags")
+    trading_days: int | None = Field(None, description="Days since first trade")
 
 
 # === Watchlist Schemas ===

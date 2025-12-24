@@ -1,7 +1,10 @@
+import asyncio
+import json
 import logging
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
 from app.models.schemas import (
     AnalysisStatus,
@@ -30,6 +33,7 @@ from app.services.full_analysis import (
     get_cached_analysis,
     is_analysis_running,
     is_cache_valid,
+    reset_analysis_status,
     run_full_analysis,
 )
 from app.services.hyperliquid import (
@@ -131,7 +135,7 @@ async def health_check():
 @router.get("/version")
 async def get_version():
     """Get API version"""
-    return {"version": "0.1.0", "api": "v1", "name": "HY Analyzer Platform"}
+    return {"version": "0.2.0", "api": "v1", "name": "HY Analyzer Platform"}
 
 
 @router.post("/traders/{address}/backtest", response_model=BacktestResult)
@@ -142,11 +146,6 @@ async def backtest_trader(
 ):
     """
     Backtest a trader by scaling realized PnL from historical fills.
-
-    - **capital**: Your custom starting capital (USDT)
-    - **period**: Time period (7d/30d/90d/180d/all)
-
-    Trades with scaled notional < 11 USDT are skipped.
     """
     try:
         wallet = WalletAddress(address=address)
@@ -187,23 +186,10 @@ async def analyze_trader(
 ):
     """
     Run complete trader analysis including stats, backtest, and AI evaluation.
-
-    This endpoint:
-    1. Checks if valid cached analysis exists (default: 1 hour validity)
-    2. Returns cached result if valid and force_refresh=False
-    3. Otherwise fetches fresh data from SuperX and Hyperliquid
-    4. Runs backtests for 7d/30d/90d periods
-    5. Generates AI evaluation for copy-trading
-    6. Saves results to database
-
-    Parameters:
-    - **capital**: Starting capital for backtest (USDT)
-    - **force_refresh**: If True, ignore cache and re-analyze
     """
     try:
         wallet = WalletAddress(address=address)
 
-        # Check cache first (unless force_refresh)
         if not request.force_refresh and is_cache_valid(wallet.address):
             cached = get_cached_analysis(wallet.address)
             if cached:
@@ -212,7 +198,9 @@ async def analyze_trader(
 
         if await is_analysis_running():
             raise HTTPException(status_code=429, detail="Another analysis is running. Please wait.")
-        return await run_full_analysis(wallet.address, request.capital)
+        return await run_full_analysis(
+            wallet.address, request.capital, use_full_history=request.use_full_history
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
@@ -242,6 +230,92 @@ async def get_trader_analysis_status(address: str):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.get("/analyze/{address}/stream")
+async def stream_analysis_status(address: str):
+    """
+    Stream analysis status updates using Server-Sent Events (SSE).
+
+    Use this endpoint for real-time progress updates during analysis.
+    Connect with EventSource in the frontend:
+
+    ```javascript
+    const es = new EventSource('/api/v1/analyze/0x.../stream');
+    es.onmessage = (e) => {
+        const status = JSON.parse(e.data);
+        console.log(status.progress, status.current_step);
+        if (status.status === 'completed' || status.status === 'failed') {
+            es.close();
+        }
+    };
+    ```
+    """
+    try:
+        wallet = WalletAddress(address=address)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    async def event_generator():
+        last_progress = -1
+        retry_count = 0
+        max_retries = 600  # 10 minutes max (600 * 1 second)
+
+        while retry_count < max_retries:
+            status = await get_analysis_status(wallet.address)
+
+            if status:
+                # Only send if progress changed
+                if status.progress != last_progress or status.status in ("completed", "failed"):
+                    last_progress = status.progress
+                    data = {
+                        "address": status.address,
+                        "status": status.status,
+                        "progress": status.progress,
+                        "current_step": status.current_step,
+                        "error": status.error,
+                    }
+                    yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+                    if status.status in ("completed", "failed"):
+                        break
+            else:
+                # Check if analysis is completed in cache
+                cached = get_cached_analysis(wallet.address)
+                if cached:
+                    data = {
+                        "address": wallet.address,
+                        "status": "completed",
+                        "progress": 100,
+                        "current_step": "已完成",
+                        "error": None,
+                    }
+                    yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+                    break
+
+            await asyncio.sleep(1)
+            retry_count += 1
+
+        # Send final message if timed out
+        if retry_count >= max_retries:
+            data = {
+                "address": wallet.address,
+                "status": "timeout",
+                "progress": 0,
+                "current_step": "分析超时",
+                "error": "Analysis timed out after 10 minutes",
+            }
+            yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+    )
+
+
 @router.get("/analyze/{address}/result", response_model=FullAnalysisResult)
 async def get_trader_analysis_result(address: str):
     """Get cached analysis result for a trader"""
@@ -266,14 +340,7 @@ async def get_traders_history(
     min_score: float | None = Query(None, ge=0, le=100),
     recommendation: str | None = Query(None),
 ):
-    """
-    Get list of previously analyzed traders.
-
-    - **sort_by**: Sort field (default: ai_score for best traders first)
-    - **order**: Sort order (default: desc)
-    - **min_score**: Minimum AI score filter
-    - **recommendation**: Filter by recommendation (strong_follow, follow, neutral, avoid, strong_avoid)
-    """
+    """Get list of previously analyzed traders."""
     return get_analysis_history(
         limit=limit,
         offset=offset,
@@ -288,6 +355,36 @@ async def get_traders_history(
 async def check_analysis_running():
     """Check if any analysis is currently running"""
     return {"running": await is_analysis_running()}
+
+
+@router.post("/analysis/reset")
+async def reset_analysis():
+    """Force reset stuck analysis status"""
+    await reset_analysis_status()
+    return {"status": "reset", "running": await is_analysis_running()}
+
+
+@router.get("/analysis/check/{address}")
+async def check_address_analyzed(address: str):
+    """Check if an address has been analyzed before."""
+    try:
+        wallet = WalletAddress(address=address)
+        cached = get_cached_analysis(wallet.address)
+        if cached:
+            return {
+                "found": True,
+                "address": cached.address,
+                "analyzed_at": cached.analyzed_at,
+                "account_value": cached.account_value,
+                "ai_score": cached.ai_evaluation.score if cached.ai_evaluation else None,
+                "ai_recommendation": cached.ai_evaluation.recommendation if cached.ai_evaluation else None,
+                "roe_30d": cached.roe_30d,
+                "trading_days": cached.trading_days,
+                "first_trade_date": cached.first_trade_date,
+            }
+        return {"found": False, "address": wallet.address}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/history/{address}")
@@ -313,23 +410,14 @@ async def get_watchlist(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
-    """
-    Get all watchlist entries with analysis data.
-
-    - **sort_by**: Sort field (default: priority)
-    - **order**: Sort order (default: desc for highest priority first)
-    """
+    """Get all watchlist entries with analysis data."""
     service = get_watchlist_service()
     return service.get_watchlist(sort_by=sort_by, order=order, limit=limit, offset=offset)
 
 
 @router.post("/watchlist", response_model=dict)
 async def add_to_watchlist(request: WatchlistAddRequest):
-    """
-    Add an address to the watchlist.
-
-    Once added, fills data will be automatically synced in the background.
-    """
+    """Add an address to the watchlist."""
     service = get_watchlist_service()
     result = service.add_to_watchlist(
         address=request.address,
@@ -339,7 +427,6 @@ async def add_to_watchlist(request: WatchlistAddRequest):
         auto_update=request.auto_update,
     )
 
-    # Trigger initial sync
     if result["status"] == "added":
         fills_cache = get_fills_cache_service()
         try:
@@ -411,11 +498,7 @@ async def sync_watchlist_address(
     address: str,
     full: bool = Query(False, description="Full sync (fetch all history) vs incremental"),
 ):
-    """
-    Manually trigger data sync for a watchlist address.
-
-    - **full**: If True, fetches all available history; otherwise only new data
-    """
+    """Manually trigger data sync for a watchlist address."""
     try:
         wallet = WalletAddress(address=address)
         fills_cache = get_fills_cache_service()

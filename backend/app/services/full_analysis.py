@@ -11,12 +11,16 @@ from app.models.schemas import (
     AnalysisStatus,
     BacktestSummary,
     FullAnalysisResult,
+    HighFrequencyWarning,
     TraderHistoryItem,
 )
 from app.services.ai_scoring import get_ai_scoring_service
 from app.services.analyzer import compute_trade_metrics_timeframes, parse_superx_stats
 from app.services.backtest import period_to_time_range_ms, run_backtest
 from app.services.hyperliquid import get_hyperliquid_service, get_superx_service
+
+# Threshold for high-frequency trader detection
+HIGH_FREQUENCY_THRESHOLD = 8000  # 90d fills that likely exceed 10K API limit
 
 logger = logging.getLogger(__name__)
 
@@ -34,15 +38,137 @@ async def is_analysis_running() -> bool:
         return any(s.status == "analyzing" for s in _current_analysis.values())
 
 
+async def reset_analysis_status():
+    """Force reset all analysis status (use when stuck)"""
+    async with _analysis_lock:
+        for addr in list(_current_analysis.keys()):
+            if _current_analysis[addr].status == "analyzing":
+                _current_analysis[addr] = AnalysisStatus(
+                    address=addr,
+                    status="failed",
+                    progress=0,
+                    current_step=None,
+                    error="Analysis reset by user",
+                    high_frequency_warning=None,
+                )
+        return True
+
+
 def _update_status(
-    address: str, status: str, progress: int, step: str | None = None, error: str | None = None
+    address: str,
+    status: str,
+    progress: int,
+    step: str | None = None,
+    error: str | None = None,
+    high_freq_warning: HighFrequencyWarning | None = None,
 ):
     _current_analysis[address.lower()] = AnalysisStatus(
-        address=address.lower(), status=status, progress=progress, current_step=step, error=error
+        address=address.lower(),
+        status=status,
+        progress=progress,
+        current_step=step,
+        error=error,
+        high_frequency_warning=high_freq_warning,
     )
 
 
-async def run_full_analysis(address: str, capital: float = 10000.0) -> FullAnalysisResult:
+def _safe_float(val, default: float = 0.0) -> float:
+    """Safely convert value to float with fallback"""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def calculate_win_rate_from_fills(fills: list) -> float | None:
+    """Calculate win rate from fills data as fallback when SuperX fails"""
+    if not fills:
+        return None
+
+    winning_trades = 0
+    total_trades = 0
+
+    for f in fills:
+        closed_pnl = _safe_float(f.get("closedPnl"))
+        if closed_pnl != 0:  # Only count trades with closed PnL
+            total_trades += 1
+            if closed_pnl > 0:
+                winning_trades += 1
+
+    if total_trades == 0:
+        return None
+
+    return round((winning_trades / total_trades) * 100, 2)
+
+
+def calculate_profit_factor_from_fills(fills: list) -> float | None:
+    """Calculate profit factor from fills data as fallback when SuperX fails"""
+    if not fills:
+        return None
+
+    gross_profit = 0.0
+    gross_loss = 0.0
+
+    for f in fills:
+        closed_pnl = _safe_float(f.get("closedPnl"))
+        fee = _safe_float(f.get("fee"))
+        net_pnl = closed_pnl - fee
+
+        if net_pnl > 0:
+            gross_profit += net_pnl
+        elif net_pnl < 0:
+            gross_loss += abs(net_pnl)
+
+    if gross_loss == 0:
+        if gross_profit > 0:
+            return 100.0  # Cap at 100 (near-infinite profit factor)
+        return None
+
+    pf = gross_profit / gross_loss
+    # Cap at reasonable range
+    if pf > 100:
+        pf = 100.0
+    elif pf < 0.01:
+        pf = 0.01
+
+    return round(pf, 2)
+
+
+def calculate_trading_days_from_fills(fills: list) -> tuple[int | None, datetime | None]:
+    """
+    Calculate trading days (survival days) from fills data.
+    Returns (trading_days, first_trade_date)
+    """
+    if not fills:
+        return None, None
+
+    timestamps = []
+    for f in fills:
+        t = f.get("time")
+        if t is not None:
+            try:
+                timestamps.append(int(t))
+            except (TypeError, ValueError):
+                continue
+
+    if not timestamps:
+        return None, None
+
+    first_t = min(timestamps)
+    now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+    trading_days = max(1, int((now_ms - first_t) / 86400000))
+
+    # Convert first trade timestamp to datetime
+    first_trade_date = datetime.fromtimestamp(first_t / 1000, tz=UTC)
+
+    return trading_days, first_trade_date
+
+
+async def run_full_analysis(
+    address: str, capital: float = 10000.0, use_full_history: bool = False
+) -> FullAnalysisResult:
     addr = address.lower()
 
     async with _analysis_lock:
@@ -56,77 +182,151 @@ async def run_full_analysis(address: str, capital: float = 10000.0) -> FullAnaly
     result = FullAnalysisResult(address=addr, analyzed_at=datetime.now(tz=UTC))
 
     try:
-        # Phase 1: Parallel fetch - account value, SuperX stats, 90-day fills, and all-time fills
-        _update_status(addr, "analyzing", 10, "并行获取数据")
+        # Phase 1: Sequential fetch to avoid 429 rate limiting
+        _update_status(addr, "analyzing", 5, "获取账户数据")
 
         start_90d, end_90d = period_to_time_range_ms("90d")
-        start_all, end_all = period_to_time_range_ms("all")
 
-        async def fetch_account_value():
-            return await hl.get_account_value(addr)
+        # Fetch account value first (lightweight call)
+        account_value = await hl.get_account_value(addr)
+        _update_status(addr, "analyzing", 10, "账户余额获取完成")
 
-        async def fetch_superx_stats():
-            try:
-                return await superx.get_trader_stats(addr)
-            except Exception as e:
-                logger.warning("Failed to fetch SuperX stats: %s", e)
-                return None
+        await asyncio.sleep(0.5)
 
-        async def fetch_fills_90d():
-            return await hl.get_user_fills_windowed(
-                addr, start_time=start_90d, end_time=end_90d, aggregate=False
-            )
+        # Fetch SuperX stats (separate API, can run after HL call)
+        superx_data = None
+        superx_failed = False
+        try:
+            _update_status(addr, "analyzing", 12, "获取SuperX数据")
+            superx_data = await superx.get_trader_stats(addr)
+        except Exception as e:
+            logger.warning("Failed to fetch SuperX stats: %s", e)
+            superx_failed = True
 
-        async def fetch_fills_all():
-            return await hl.get_user_fills_windowed(
-                addr, start_time=start_all, end_time=end_all, aggregate=False
-            )
+        await asyncio.sleep(0.5)
 
-        # Run all four in parallel
-        account_value, superx_data, fills_90d, fills_all = await asyncio.gather(
-            fetch_account_value(), fetch_superx_stats(), fetch_fills_90d(), fetch_fills_all()
+        _update_status(addr, "analyzing", 15, "获取90天交易记录")
+
+        # Fetch 90d fills (heaviest call)
+        fills_90d = await hl.get_user_fills_windowed(
+            addr, start_time=start_90d, end_time=end_90d, aggregate=False
         )
+
+        _update_status(addr, "analyzing", 25, f"获取到 {len(fills_90d)} 笔交易记录")
 
         result.account_value = account_value
 
-        _update_status(addr, "analyzing", 40, "处理SuperX数据")
-        if superx_data:
+        # Check if whale account based on cumulative volume (>$1B)
+        is_whale_account = await hl.is_high_frequency_account(addr)
+        deposit_pnl_data = None
+
+        if is_whale_account:
+            _update_status(addr, "analyzing", 28, "高频账户：使用存取款方式计算PnL")
+            deposit_pnl_data = await hl.calculate_pnl_from_deposits(addr)
+            logger.info("Whale account detected: %s, using deposit-based PnL: $%.2f", addr[:10], deposit_pnl_data["total_pnl"])
+
+        # Check if high-frequency trader (likely to exceed API limit)
+        fills_90d_count = len(fills_90d)
+        is_high_frequency = fills_90d_count >= HIGH_FREQUENCY_THRESHOLD or is_whale_account
+        data_limited = False
+
+        if is_high_frequency and not use_full_history:
+            logger.info(
+                "High-frequency trader detected: %s has %d fills in 90d, using 90d data",
+                addr[:10], fills_90d_count
+            )
+            _update_status(
+                addr, "analyzing", 30,
+                f"高频交易员检测：90天内{fills_90d_count}笔交易，使用90天数据"
+            )
+            fills_all = fills_90d
+            data_limited = True
+        else:
+            _update_status(addr, "analyzing", 30, "获取全历史数据（可能需要5-10分钟）")
+
+            def s3_progress(completed: int, total: int):
+                if total > 0:
+                    pct = 30 + int((completed / total) * 20)
+                    _update_status(
+                        addr, "analyzing", pct,
+                        f"从S3获取历史数据 ({completed}/{total} 小时, {int(completed/total*100)}%)"
+                    )
+
+            start_all, end_all = period_to_time_range_ms("all")
+            fills_all = []
+            try:
+                fills_all = await asyncio.wait_for(
+                    hl.get_user_fills_windowed(
+                        addr, start_time=start_all, end_time=end_all, aggregate=False,
+                        s3_progress_callback=s3_progress if use_full_history else None,
+                    ),
+                    timeout=600.0 if use_full_history else 60.0
+                )
+            except TimeoutError:
+                logger.warning("All-time fills fetch timed out for %s, using 90d data", addr)
+                fills_all = fills_90d
+                data_limited = True
+
+        # Calculate trading_days (survival days) - ALWAYS calculate this
+        trading_days, first_trade_date = calculate_trading_days_from_fills(
+            fills_all if fills_all else fills_90d
+        )
+        result.trading_days = trading_days
+        result.first_trade_date = first_trade_date
+
+        if data_limited:
+            _update_status(addr, "analyzing", 50, "使用90天数据（全历史数据受限）")
+            result.data_limited = True
+            result.data_coverage_days = 90
+        else:
+            _update_status(addr, "analyzing", 50, "处理历史数据")
+            if fills_all:
+                first_t = min(int(f.get("time", 0)) for f in fills_all)
+                last_t = max(int(f.get("time", 0)) for f in fills_all)
+                result.data_coverage_days = int((last_t - first_t) / 86400000)
+
+        # Parse SuperX stats OR calculate from fills as fallback
+        _update_status(addr, "analyzing", 52, "计算胜率和盈亏比")
+
+        if superx_data and not superx_failed:
             base_stats = parse_superx_stats(addr, superx_data)
-            # Keep win_rate and profit_factor from SuperX (these are calculated correctly)
             result.win_rate = base_stats.win_rate
-            # Sanitize profit_factor: cap at reasonable range to avoid overflow values
             pf = base_stats.profit_factor
             if pf is not None:
                 if pf > 100:
-                    pf = 100.0  # Cap at 100 (extremely profitable)
+                    pf = 100.0
                 elif pf < 0.01:
-                    pf = 0.01  # Floor at 0.01 (extremely unprofitable)
+                    pf = 0.01
             result.profit_factor = pf
             result.total_trades = base_stats.total_trades
-            # Note: ROE/PnL/max_drawdown will be calculated from fills below
+        else:
+            # Fallback: calculate from fills data
+            logger.info("SuperX failed, calculating win_rate/profit_factor from fills")
+            result.win_rate = calculate_win_rate_from_fills(fills_90d)
+            result.profit_factor = calculate_profit_factor_from_fills(fills_90d)
+            # Count trades with non-zero PnL
+            trade_count = sum(1 for f in fills_90d if _safe_float(f.get("closedPnl")) != 0)
+            result.total_trades = trade_count if trade_count > 0 else len(fills_90d)
 
-        _update_status(addr, "analyzing", 50, "计算交易风格指标")
+        _update_status(addr, "analyzing", 55, "计算交易风格指标")
         metrics = compute_trade_metrics_timeframes(fills_90d, now_ms=end_90d)
         result.long_short_ratio = metrics.get("long_short_ratio_30d")
         result.avg_trade_size = metrics.get("avg_trade_size_30d")
         result.avg_holding_time = metrics.get("avg_holding_time_30d")
         result.trade_frequency = metrics.get("trade_frequency_30d")
 
-        # Phase 2: Calculate actual PnL/ROE from fills (not scaled)
-        # This is more accurate than SuperX because it excludes deposits/withdrawals
+        # Phase 2: Calculate actual PnL/ROE from fills
         def calc_actual_pnl(fills: list) -> tuple[float, int]:
-            """Calculate actual PnL from fills (sum of closedPnl - fee)"""
             total_pnl = 0.0
             count = 0
             for f in fills:
-                pnl = float(f.get("closedPnl", 0) or 0)
-                fee = float(f.get("fee", 0) or 0)
+                pnl = _safe_float(f.get("closedPnl"))
+                fee = _safe_float(f.get("fee"))
                 total_pnl += pnl - fee
                 if pnl != 0:
                     count += 1
             return total_pnl, count
 
-        # Calculate actual PnL for each period
         start_7d, end_7d = period_to_time_range_ms("7d")
         start_30d, end_30d = period_to_time_range_ms("30d")
 
@@ -135,31 +335,41 @@ async def run_full_analysis(address: str, capital: float = 10000.0) -> FullAnaly
 
         pnl_7d, _ = calc_actual_pnl(fills_7d)
         pnl_30d, _ = calc_actual_pnl(fills_30d)
-        pnl_90d, _ = calc_actual_pnl(fills_90d)
-        pnl_all, trade_count = calc_actual_pnl(fills_all)
+        pnl_90d, trade_count_90d = calc_actual_pnl(fills_90d)
 
         result.pnl_7d = round(pnl_7d, 2)
         result.pnl_30d = round(pnl_30d, 2)
         result.pnl_90d = round(pnl_90d, 2)
-        result.pnl_all_time = round(pnl_all, 2)
 
-        # Calculate ROE based on account value
         if account_value and account_value > 0:
             result.roe_7d = round(pnl_7d / account_value * 100, 2)
             result.roe_30d = round(pnl_30d / account_value * 100, 2)
             result.roe_90d = round(pnl_90d / account_value * 100, 2)
-            result.roe_all_time = round(pnl_all / account_value * 100, 2)
 
-        if trade_count > 0:
-            result.total_trades = trade_count
+        # All-time metrics
+        if data_limited:
+            if deposit_pnl_data:
+                result.pnl_all_time = round(deposit_pnl_data["total_pnl"], 2)
+                if account_value and account_value > 0:
+                    result.roe_all_time = round(deposit_pnl_data["total_pnl"] / account_value * 100, 2)
+            else:
+                result.pnl_all_time = None
+                result.roe_all_time = None
+            result.total_trades = result.total_trades or (trade_count_90d if trade_count_90d > 0 else None)
+        else:
+            pnl_all, trade_count_all = calc_actual_pnl(fills_all)
+            result.pnl_all_time = round(pnl_all, 2)
+            if account_value and account_value > 0:
+                result.roe_all_time = round(pnl_all / account_value * 100, 2)
+            if trade_count_all > 0:
+                result.total_trades = trade_count_all
+
+        _update_status(addr, "analyzing", 60, "计算PnL/ROE完成")
 
         # Phase 3: Run backtests for drawdown calculation
         if account_value and account_value > 0:
-            _update_status(addr, "analyzing", 60, "运行回测")
+            _update_status(addr, "analyzing", 65, "运行7天回测")
 
-            # fills_7d, fills_30d already calculated above
-
-            # Run backtests (CPU operations, negligible time)
             try:
                 if fills_7d:
                     bt_7d = run_backtest(
@@ -176,9 +386,18 @@ async def run_full_analysis(address: str, capital: float = 10000.0) -> FullAnaly
                         max_drawdown_pct=bt_7d.max_drawdown_pct,
                         trade_count=bt_7d.trade_count,
                     )
+                else:
+                    # No fills in 7d, create empty backtest
+                    result.backtest_7d = BacktestSummary(
+                        period="7d", pnl=0, roe=0, max_drawdown_pct=0, trade_count=0
+                    )
             except Exception as e:
                 logger.warning("7d backtest failed: %s", e)
+                result.backtest_7d = BacktestSummary(
+                    period="7d", pnl=0, roe=0, max_drawdown_pct=0, trade_count=0
+                )
 
+            _update_status(addr, "analyzing", 70, "运行30天回测")
             try:
                 if fills_30d:
                     bt_30d = run_backtest(
@@ -195,9 +414,17 @@ async def run_full_analysis(address: str, capital: float = 10000.0) -> FullAnaly
                         max_drawdown_pct=bt_30d.max_drawdown_pct,
                         trade_count=bt_30d.trade_count,
                     )
+                else:
+                    result.backtest_30d = BacktestSummary(
+                        period="30d", pnl=0, roe=0, max_drawdown_pct=0, trade_count=0
+                    )
             except Exception as e:
                 logger.warning("30d backtest failed: %s", e)
+                result.backtest_30d = BacktestSummary(
+                    period="30d", pnl=0, roe=0, max_drawdown_pct=0, trade_count=0
+                )
 
+            _update_status(addr, "analyzing", 75, "运行90天回测")
             try:
                 if fills_90d:
                     bt_90d = run_backtest(
@@ -214,32 +441,49 @@ async def run_full_analysis(address: str, capital: float = 10000.0) -> FullAnaly
                         max_drawdown_pct=bt_90d.max_drawdown_pct,
                         trade_count=bt_90d.trade_count,
                     )
+                else:
+                    result.backtest_90d = BacktestSummary(
+                        period="90d", pnl=0, roe=0, max_drawdown_pct=0, trade_count=0
+                    )
             except Exception as e:
                 logger.warning("90d backtest failed: %s", e)
+                result.backtest_90d = BacktestSummary(
+                    period="90d", pnl=0, roe=0, max_drawdown_pct=0, trade_count=0
+                )
 
-            # All-time backtest (using fills_all)
-            try:
-                if fills_all:
-                    bt_all = run_backtest(
-                        address=addr,
-                        period="all",
-                        capital=capital,
-                        account_value=account_value,
-                        fills=fills_all,
-                    )
-                    result.backtest_all_time = BacktestSummary(
-                        period="all",
-                        pnl=bt_all.simulated_pnl,
-                        roe=bt_all.simulated_roe,
-                        max_drawdown_pct=bt_all.max_drawdown_pct,
-                        trade_count=bt_all.trade_count,
-                    )
-                    # Use our own calculated max_drawdown_pct (more accurate than SuperX)
-                    result.max_drawdown_pct = bt_all.max_drawdown_pct
-            except Exception as e:
-                logger.warning("all-time backtest failed: %s", e)
+            _update_status(addr, "analyzing", 80, "运行全部时间回测")
+            if data_limited:
+                if result.backtest_90d:
+                    result.max_drawdown_pct = result.backtest_90d.max_drawdown_pct
+                result.backtest_all_time = None
+            else:
+                try:
+                    if fills_all:
+                        bt_all = run_backtest(
+                            address=addr,
+                            period="all",
+                            capital=capital,
+                            account_value=account_value,
+                            fills=fills_all,
+                        )
+                        result.backtest_all_time = BacktestSummary(
+                            period="all",
+                            pnl=bt_all.simulated_pnl,
+                            roe=bt_all.simulated_roe,
+                            max_drawdown_pct=bt_all.max_drawdown_pct,
+                            trade_count=bt_all.trade_count,
+                        )
+                        result.max_drawdown_pct = bt_all.max_drawdown_pct
+                except Exception as e:
+                    logger.warning("all-time backtest failed: %s", e)
+                    if result.backtest_90d:
+                        result.max_drawdown_pct = result.backtest_90d.max_drawdown_pct
 
-        _update_status(addr, "analyzing", 80, "AI双模型评估中")
+        # Ensure max_drawdown_pct is set
+        if result.max_drawdown_pct is None and result.backtest_90d:
+            result.max_drawdown_pct = result.backtest_90d.max_drawdown_pct
+
+        _update_status(addr, "analyzing", 85, "AI双模型评估中")
         ai_service = get_ai_scoring_service()
         result.ai_evaluation = await ai_service.evaluate(result)
 
@@ -280,8 +524,15 @@ def _save_to_database(result: FullAnalysisResult):
             "avg_trade_size": result.avg_trade_size,
             "avg_holding_time": result.avg_holding_time,
             "trade_frequency": result.trade_frequency,
+            "trading_days": result.trading_days,
             "status": "completed",
+            "data_limited": result.data_limited,
+            "data_coverage_days": result.data_coverage_days,
         }
+
+        # Save first_trade_date if available
+        if result.first_trade_date:
+            data["first_trade_date"] = result.first_trade_date
 
         if result.backtest_7d:
             data["backtest_pnl_7d"] = result.backtest_7d.pnl
@@ -316,6 +567,13 @@ def _save_to_database(result: FullAnalysisResult):
             data["ai_codex_score"] = result.ai_evaluation.codex_score
             data["ai_models_used"] = ",".join(result.ai_evaluation.models_used)
             data["ai_trading_tags"] = ",".join(result.ai_evaluation.trading_tags)
+            if result.ai_evaluation.score_breakdown:
+                data["ai_score_breakdown"] = [
+                    {"item": b.item if hasattr(b, 'item') else b.get("item", ""),
+                     "points": b.points if hasattr(b, 'points') else b.get("points", 0),
+                     "type": b.type if hasattr(b, 'type') else b.get("type", "positive")}
+                    for b in result.ai_evaluation.score_breakdown
+                ]
 
         if existing:
             for key, value in data.items():
@@ -344,13 +602,11 @@ def get_analysis_history(
     try:
         query = db.query(TraderAnalysis)
 
-        # Apply filters
         if min_score is not None:
             query = query.filter(TraderAnalysis.ai_score >= min_score)
         if recommendation:
             query = query.filter(TraderAnalysis.ai_recommendation == recommendation)
 
-        # Determine sort column
         sort_columns = {
             "ai_score": TraderAnalysis.ai_score,
             "analyzed_at": TraderAnalysis.analyzed_at,
@@ -359,15 +615,11 @@ def get_analysis_history(
         }
         sort_col = sort_columns.get(sort_by, TraderAnalysis.ai_score)
 
-        # Apply sorting with nulls last
         if order == "desc":
-            # For DESC, nulls should be at the bottom
             query = query.order_by(sort_col.desc().nullslast())
         else:
-            # For ASC, nulls should be at the bottom too
             query = query.order_by(sort_col.asc().nullslast())
 
-        # Secondary sort by analyzed_at for ties
         if sort_by != "analyzed_at":
             query = query.order_by(TraderAnalysis.analyzed_at.desc())
 
@@ -417,7 +669,11 @@ def get_cached_analysis(address: str) -> FullAnalysisResult | None:
             avg_trade_size=r.avg_trade_size,
             avg_holding_time=r.avg_holding_time,
             trade_frequency=r.trade_frequency,
+            trading_days=getattr(r, "trading_days", None),
+            first_trade_date=getattr(r, "first_trade_date", None),
             status=r.status or "completed",
+            data_limited=getattr(r, "data_limited", False) or False,
+            data_coverage_days=getattr(r, "data_coverage_days", None),
         )
 
         if r.backtest_roe_7d is not None:
@@ -457,12 +713,17 @@ def get_cached_analysis(address: str) -> FullAnalysisResult | None:
             )
 
         if r.ai_score is not None:
+            score_breakdown_data = getattr(r, "ai_score_breakdown", None) or []
             result.ai_evaluation = AIEvaluation(
                 score=r.ai_score,
                 recommendation=r.ai_recommendation or "neutral",
                 risk_level=r.ai_risk_level or "medium",
                 reasoning=r.ai_reasoning or "",
                 trading_tags=r.ai_trading_tags.split(",") if r.ai_trading_tags else [],
+                score_breakdown=score_breakdown_data,
+                claude_score=getattr(r, "ai_claude_score", None),
+                codex_score=getattr(r, "ai_codex_score", None),
+                models_used=r.ai_models_used.split(",") if getattr(r, "ai_models_used", None) else [],
             )
 
         return result
@@ -480,7 +741,6 @@ def is_cache_valid(address: str) -> bool:
         if not r or not r.analyzed_at:
             return False
 
-        # Make sure both datetimes are timezone-aware
         analyzed_at = r.analyzed_at
         if analyzed_at.tzinfo is None:
             analyzed_at = analyzed_at.replace(tzinfo=UTC)
