@@ -1,0 +1,509 @@
+"""
+S3-based historical fills fetcher for Hyperliquid.
+
+Bypasses the 10K fills limit by directly accessing multiple S3 data sources:
+- s3://hl-mainnet-node-data/node_trades (from 2025-03-22, contains both sides)
+- s3://hl-mainnet-node-data/node_fills (from 2025-05-25, API format)
+- s3://hl-mainnet-node-data/node_fills_by_block (from 2025-07-27, current format)
+
+Data is organized by date/hour: {prefix}/hourly/{YYYYMMDD}/{HH}.lz4
+
+NOTE: Hyperliquid S3 bucket uses "requester pays" model.
+You need AWS credentials and will be charged for data transfer (~$0.09/GB).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
+
+import boto3
+from botocore.config import Config
+
+from app.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+# Thread pool for S3 operations (boto3 is not async-native)
+# Use 96 workers to maximize S3 IO parallelism (network bound, not CPU bound)
+_executor = ThreadPoolExecutor(max_workers=96)
+
+# S3 bucket info
+BUCKET_NAME = "hl-mainnet-node-data"
+
+# Data source configurations with availability dates
+DATA_SOURCES = {
+    "node_fills_by_block": {
+        "prefix": "node_fills_by_block/hourly",
+        "start_date": datetime(2025, 7, 27, tzinfo=UTC),
+        "priority": 1,  # Highest priority (newest format)
+        "format": "fills",
+    },
+    "node_fills": {
+        "prefix": "node_fills/hourly",
+        "start_date": datetime(2025, 5, 25, tzinfo=UTC),
+        "priority": 2,
+        "format": "fills",
+    },
+    "node_trades": {
+        "prefix": "node_trades/hourly",
+        "start_date": datetime(2025, 3, 22, tzinfo=UTC),
+        "priority": 3,  # Lowest priority but oldest data
+        "format": "trades",
+    },
+}
+
+
+def _parse_iso_time(time_str: str | None) -> int:
+    """Parse ISO format time string to milliseconds timestamp"""
+    if not time_str:
+        return 0
+    try:
+        dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+        return int(dt.timestamp() * 1000)
+    except (ValueError, AttributeError, TypeError):
+        return 0
+
+
+def _convert_trade_to_fill(trade: dict, side_info: dict, is_buyer: bool) -> dict:
+    """Convert node_trades format to fills format for a specific side"""
+    time_ms = _parse_iso_time(trade.get("time"))
+
+    return {
+        "coin": trade.get("coin"),
+        "px": trade.get("px"),
+        "sz": trade.get("sz"),
+        "side": "B" if is_buyer else "A",
+        "time": time_ms,
+        "hash": trade.get("hash"),
+        "oid": side_info.get("oid"),
+        "user": side_info.get("user"),
+        "startPosition": side_info.get("start_pos"),
+        "cloid": side_info.get("cloid"),
+        "twapId": side_info.get("twap_id"),
+        "_source": "node_trades",
+    }
+
+
+class S3FillsService:
+    """Fetches historical fills from Hyperliquid S3 archive with multi-source support"""
+
+    def __init__(self):
+        settings = get_settings()
+        self._enabled = bool(settings.aws_access_key_id and settings.aws_secret_access_key)
+
+        if self._enabled:
+            self._s3 = boto3.client(
+                "s3",
+                aws_access_key_id=settings.aws_access_key_id,
+                aws_secret_access_key=settings.aws_secret_access_key,
+                region_name=settings.aws_region,
+                config=Config(
+                    retries={"max_attempts": 3, "mode": "adaptive"},
+                    connect_timeout=10,
+                    read_timeout=60,
+                    max_pool_connections=128,  # Match thread pool size for full parallelism
+                ),
+            )
+            logger.info("S3FillsService initialized with AWS credentials")
+        else:
+            self._s3 = None
+            logger.warning(
+                "AWS credentials not configured. S3 historical fills disabled. "
+                "Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in .env"
+            )
+
+        self._lz4_available = self._check_lz4()
+
+    def _check_lz4(self) -> bool:
+        try:
+            import lz4.frame
+
+            return True
+        except ImportError:
+            logger.warning("lz4 not installed, S3 compressed data cannot be read")
+            return False
+
+    def _get_best_source_for_date(self, dt: datetime) -> str | None:
+        """Determine the best data source for a given date"""
+        available = []
+        for name, config in DATA_SOURCES.items():
+            if dt >= config["start_date"]:
+                available.append((config["priority"], name))
+
+        if not available:
+            return None
+
+        available.sort()
+        return available[0][1]
+
+    def _check_file_exists(self, key: str) -> bool:
+        """Check if S3 file exists"""
+        if not self._enabled or not self._s3:
+            return False
+        try:
+            self._s3.head_object(
+                Bucket=BUCKET_NAME,
+                Key=key,
+                RequestPayer="requester",
+            )
+            return True
+        except Exception:
+            return False
+
+    def _download_file(self, key: str) -> bytes | None:
+        """Download and decompress S3 file (no local caching to save disk space)"""
+        if not self._enabled or not self._s3:
+            return None
+
+        try:
+            response = self._s3.get_object(
+                Bucket=BUCKET_NAME,
+                Key=key,
+                RequestPayer="requester",
+            )
+            content = response["Body"].read()
+
+            if key.endswith(".lz4"):
+                if not self._lz4_available:
+                    return None
+                import lz4.frame
+
+                content = lz4.frame.decompress(content)
+
+            return content
+        except Exception as e:
+            logger.debug("Failed to download S3 file %s: %s", key, e)
+            return None
+
+    def _parse_fills_file(self, content: bytes, target_address: str) -> list[dict]:
+        """Parse node_fills or node_fills_by_block format with fast pre-filtering."""
+        fills = []
+        target_lower = target_address.lower()
+        # Pre-compute search pattern for fast string matching (avoid JSON parsing for non-matching lines)
+        target_pattern = target_lower.encode('utf-8')
+
+        for line in content.split(b"\n"):
+            if not line:
+                continue
+            # OPTIMIZATION: Fast byte-level check before JSON parsing
+            # Skip lines that don't contain the target address at all
+            if target_pattern not in line.lower():
+                continue
+
+            try:
+                data = json.loads(line.decode("utf-8"))
+                if isinstance(data, dict):
+                    # Single fill or batched block format
+                    if "events" in data:
+                        # Batched format: {local_time, block_time, block_number, events}
+                        for event in data.get("events", []):
+                            if isinstance(event, dict):
+                                user = event.get("user", "").lower()
+                                if user == target_lower:
+                                    fills.append(event)
+                    else:
+                        user = data.get("user", "").lower()
+                        if user == target_lower:
+                            fills.append(data)
+                elif isinstance(data, list):
+                    for fill in data:
+                        if isinstance(fill, dict):
+                            user = fill.get("user", "").lower()
+                            if user == target_lower:
+                                fills.append(fill)
+            except json.JSONDecodeError:
+                continue
+
+        return fills
+
+    def _parse_trades_file(self, content: bytes, target_address: str) -> list[dict]:
+        """Parse node_trades format and convert to fills with fast pre-filtering."""
+        fills = []
+        target_lower = target_address.lower()
+        # Pre-compute search pattern for fast string matching
+        target_pattern = target_lower.encode('utf-8')
+
+        for line in content.split(b"\n"):
+            if not line:
+                continue
+            # OPTIMIZATION: Fast byte-level check before JSON parsing
+            if target_pattern not in line.lower():
+                continue
+
+            try:
+                data = json.loads(line.decode("utf-8"))
+                if isinstance(data, dict):
+                    trades_to_process = [data]
+                elif isinstance(data, list):
+                    trades_to_process = data
+                else:
+                    continue
+
+                for trade in trades_to_process:
+                    if not isinstance(trade, dict):
+                        continue
+
+                    side_info_list = trade.get("side_info", [])
+                    if len(side_info_list) >= 2:
+                        # side_info[0] = maker/seller, side_info[1] = taker/buyer
+                        # Check if either side matches target address
+                        for i, side_info in enumerate(side_info_list[:2]):
+                            if isinstance(side_info, dict):
+                                user = side_info.get("user", "").lower()
+                                if user == target_lower:
+                                    is_buyer = i == 1
+                                    fill = _convert_trade_to_fill(trade, side_info, is_buyer)
+                                    fills.append(fill)
+            except json.JSONDecodeError:
+                continue
+
+        return fills
+
+    def _fetch_hour_data_sync(
+        self,
+        date_str: str,
+        hour: int,
+        target_address: str,
+    ) -> list[dict]:
+        """Fetch fills for a specific hour from the best available source.
+
+        OPTIMIZATION: Only try ONE data source per hour (the best one for that date).
+        Don't fall back to other sources just because no fills were found - that's
+        expected for most hours where the user didn't trade.
+        """
+        dt = datetime.strptime(date_str, "%Y%m%d").replace(hour=hour, tzinfo=UTC)
+
+        # Find the best (highest priority) source for this date
+        best_source = None
+        best_priority = float('inf')
+        for name, config in DATA_SOURCES.items():
+            if dt >= config["start_date"] and config["priority"] < best_priority:
+                best_priority = config["priority"]
+                best_source = (name, config)
+
+        if best_source is None:
+            return []
+
+        source_name, config = best_source
+
+        # Only use zero-padded format (standard S3 format)
+        # Non-padded format was never actually used in production data
+        key = f"{config['prefix']}/{date_str}/{hour:02d}.lz4"
+        content = self._download_file(key)
+
+        if content is None:
+            # File doesn't exist or download failed - this is normal for some hours
+            return []
+
+        # Parse based on format
+        if config["format"] == "fills":
+            fills = self._parse_fills_file(content, target_address)
+        else:
+            fills = self._parse_trades_file(content, target_address)
+
+        if fills:
+            logger.debug(
+                "Found %d fills from %s for %s/%d", len(fills), source_name, date_str, hour
+            )
+
+        return fills
+
+    async def fetch_fills_range(
+        self,
+        address: str,
+        start_time: int,
+        end_time: int | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
+        partial_result_callback: Callable[[list[dict], int, int], None] | None = None,
+    ) -> list[dict]:
+        """
+        Fetch fills for an address within a time range from S3.
+
+        Automatically selects the best available data source for each time period:
+        - node_fills_by_block: 2025-07-27+
+        - node_fills: 2025-05-25+
+        - node_trades: 2025-03-22+
+
+        OPTIMIZATION: Fetches newest data first (progressive loading) so users can
+        see recent results quickly while older data continues loading.
+
+        Args:
+            address: Wallet address
+            start_time: Start timestamp in milliseconds
+            end_time: End timestamp in milliseconds (default: now)
+            progress_callback: Optional callback(completed, total) for progress updates
+            partial_result_callback: Optional callback(fills_so_far, completed, total)
+                                     for progressive results display
+
+        Returns:
+            List of fill records matching the address
+        """
+        if not self._enabled:
+            logger.warning("S3 fills disabled - AWS credentials not configured")
+            return []
+
+        if end_time is None:
+            end_time = int(datetime.now(UTC).timestamp() * 1000)
+
+        start_dt = datetime.fromtimestamp(start_time / 1000, tz=UTC)
+        end_dt = datetime.fromtimestamp(end_time / 1000, tz=UTC)
+
+        # Earliest available data
+        earliest_available = min(c["start_date"] for c in DATA_SOURCES.values())
+        if start_dt < earliest_available:
+            logger.info(
+                "Requested start %s is before earliest S3 data %s, adjusting",
+                start_dt.isoformat(),
+                earliest_available.isoformat(),
+            )
+            start_dt = earliest_available
+
+        # Generate hours to query
+        hours_to_query: list[tuple[str, int]] = []
+        current = start_dt.replace(minute=0, second=0, microsecond=0)
+        while current <= end_dt:
+            date_str = current.strftime("%Y%m%d")
+            hours_to_query.append((date_str, current.hour))
+            current += timedelta(hours=1)
+
+        # OPTIMIZATION: Reverse order to fetch newest data first (progressive loading)
+        # Users can see recent results quickly while older data continues loading
+        hours_to_query.reverse()
+
+        total_hours = len(hours_to_query)
+        logger.info(
+            "S3 fills query: address=%s, range=%s to %s, hours=%d (newest first)",
+            address[:10],
+            start_dt.isoformat(),
+            end_dt.isoformat(),
+            total_hours,
+        )
+
+        # Fetch all hours in parallel - ThreadPoolExecutor limits actual concurrency
+        loop = asyncio.get_event_loop()
+        all_fills: list[dict] = []
+        seen: set[str] = set()  # For deduplication
+        completed_count = 0
+
+        def _dedupe_key(fill: dict) -> str:
+            return fill.get("hash") or f"{fill.get('time')}:{fill.get('coin')}:{fill.get('oid')}"
+
+        # Process in batches to allow progress updates and partial results
+        batch_size = 200  # Process 200 hours at a time (matches thread pool capacity)
+        for batch_start in range(0, total_hours, batch_size):
+            batch_end = min(batch_start + batch_size, total_hours)
+            batch = hours_to_query[batch_start:batch_end]
+
+            tasks = [
+                loop.run_in_executor(
+                    _executor,
+                    self._fetch_hour_data_sync,
+                    date_str,
+                    hour,
+                    address,
+                )
+                for date_str, hour in batch
+            ]
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, list):
+                    for fill in result:
+                        # Filter by time range and deduplicate on the fly
+                        fill_time = fill.get("time")
+                        if fill_time is None:
+                            continue
+                        try:
+                            t = int(fill_time)
+                        except (TypeError, ValueError):
+                            continue
+                        if start_time <= t <= end_time:
+                            key = _dedupe_key(fill)
+                            if key not in seen:
+                                seen.add(key)
+                                all_fills.append(fill)
+                elif isinstance(result, Exception):
+                    logger.debug("S3 fetch error: %s", result)
+
+            completed_count += len(batch)
+            if progress_callback:
+                try:
+                    progress_callback(completed_count, total_hours)
+                except Exception as e:
+                    logger.debug("Progress callback error: %s", e)
+
+            # OPTIMIZATION: Provide partial results for progressive display
+            if partial_result_callback and all_fills:
+                try:
+                    # Sort current fills by time (newest first for display)
+                    sorted_partial = sorted(all_fills, key=lambda f: int(f.get("time", 0)), reverse=True)
+                    partial_result_callback(sorted_partial, completed_count, total_hours)
+                except Exception as e:
+                    logger.debug("Partial result callback error: %s", e)
+
+        # Final sort by time (oldest first for consistency)
+        all_fills.sort(key=lambda f: int(f.get("time", 0)))
+
+        logger.info("S3 fills result: found %d fills for %s", len(all_fills), address[:10])
+        return all_fills
+
+    async def check_availability(self) -> dict:
+        """Check S3 data source availability"""
+        if not self._enabled:
+            return {"enabled": False, "sources": {}}
+
+        result = {"enabled": True, "sources": {}}
+        loop = asyncio.get_event_loop()
+
+        for name, config in DATA_SOURCES.items():
+            # Check yesterday's data
+            yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y%m%d")
+            key = f"{config['prefix']}/{yesterday}/12.lz4"
+
+            exists = await loop.run_in_executor(
+                _executor,
+                self._check_file_exists,
+                key,
+            )
+
+            result["sources"][name] = {
+                "available": exists,
+                "start_date": config["start_date"].strftime("%Y-%m-%d"),
+                "format": config["format"],
+            }
+
+        return result
+
+    def get_data_coverage(self) -> dict:
+        """Get information about data coverage"""
+        return {
+            "earliest_date": "2025-03-22",
+            "sources": {
+                name: {
+                    "start_date": config["start_date"].strftime("%Y-%m-%d"),
+                    "format": config["format"],
+                }
+                for name, config in DATA_SOURCES.items()
+            },
+            "note": "Data before 2025-03-22 requires running a Hyperliquid node",
+        }
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+
+# Singleton
+_s3_service: S3FillsService | None = None
+
+
+def get_s3_fills_service() -> S3FillsService:
+    global _s3_service
+    if _s3_service is None:
+        _s3_service = S3FillsService()
+    return _s3_service
