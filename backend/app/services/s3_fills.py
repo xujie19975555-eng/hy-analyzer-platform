@@ -12,9 +12,12 @@ NOTE: Hyperliquid S3 bucket uses "requester pays" model.
 You need AWS credentials and will be charged for data transfer (~$0.09/GB).
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
@@ -26,7 +29,8 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 # Thread pool for S3 operations (boto3 is not async-native)
-_executor = ThreadPoolExecutor(max_workers=8)
+# Use 96 workers to maximize S3 IO parallelism (network bound, not CPU bound)
+_executor = ThreadPoolExecutor(max_workers=96)
 
 # S3 bucket info
 BUCKET_NAME = "hl-mainnet-node-data"
@@ -54,18 +58,20 @@ DATA_SOURCES = {
 }
 
 
-def _parse_iso_time(time_str: str) -> int:
+def _parse_iso_time(time_str: str | None) -> int:
     """Parse ISO format time string to milliseconds timestamp"""
+    if not time_str:
+        return 0
     try:
         dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
         return int(dt.timestamp() * 1000)
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         return 0
 
 
 def _convert_trade_to_fill(trade: dict, side_info: dict, is_buyer: bool) -> dict:
     """Convert node_trades format to fills format for a specific side"""
-    time_ms = _parse_iso_time(trade.get("time", ""))
+    time_ms = _parse_iso_time(trade.get("time"))
 
     return {
         "coin": trade.get("coin"),
@@ -79,7 +85,6 @@ def _convert_trade_to_fill(trade: dict, side_info: dict, is_buyer: bool) -> dict
         "startPosition": side_info.get("start_pos"),
         "cloid": side_info.get("cloid"),
         "twapId": side_info.get("twap_id"),
-        # Mark as converted from trades for debugging
         "_source": "node_trades",
     }
 
@@ -101,6 +106,7 @@ class S3FillsService:
                     retries={"max_attempts": 3, "mode": "adaptive"},
                     connect_timeout=10,
                     read_timeout=60,
+                    max_pool_connections=128,  # Match thread pool size for full parallelism
                 ),
             )
             logger.info("S3FillsService initialized with AWS credentials")
@@ -150,7 +156,7 @@ class S3FillsService:
             return False
 
     def _download_file(self, key: str) -> bytes | None:
-        """Download and decompress S3 file"""
+        """Download and decompress S3 file (no local caching to save disk space)"""
         if not self._enabled or not self._s3:
             return None
 
@@ -175,15 +181,22 @@ class S3FillsService:
             return None
 
     def _parse_fills_file(self, content: bytes, target_address: str) -> list[dict]:
-        """Parse node_fills or node_fills_by_block format"""
+        """Parse node_fills or node_fills_by_block format with fast pre-filtering."""
         fills = []
         target_lower = target_address.lower()
+        # Pre-compute search pattern for fast string matching (avoid JSON parsing for non-matching lines)
+        target_pattern = target_lower.encode('utf-8')
 
-        for line in content.decode("utf-8").strip().split("\n"):
+        for line in content.split(b"\n"):
             if not line:
                 continue
+            # OPTIMIZATION: Fast byte-level check before JSON parsing
+            # Skip lines that don't contain the target address at all
+            if target_pattern not in line.lower():
+                continue
+
             try:
-                data = json.loads(line)
+                data = json.loads(line.decode("utf-8"))
                 if isinstance(data, dict):
                     # Single fill or batched block format
                     if "events" in data:
@@ -209,15 +222,21 @@ class S3FillsService:
         return fills
 
     def _parse_trades_file(self, content: bytes, target_address: str) -> list[dict]:
-        """Parse node_trades format and convert to fills"""
+        """Parse node_trades format and convert to fills with fast pre-filtering."""
         fills = []
         target_lower = target_address.lower()
+        # Pre-compute search pattern for fast string matching
+        target_pattern = target_lower.encode('utf-8')
 
-        for line in content.decode("utf-8").strip().split("\n"):
+        for line in content.split(b"\n"):
             if not line:
                 continue
+            # OPTIMIZATION: Fast byte-level check before JSON parsing
+            if target_pattern not in line.lower():
+                continue
+
             try:
-                data = json.loads(line)
+                data = json.loads(line.decode("utf-8"))
                 if isinstance(data, dict):
                     trades_to_process = [data]
                 elif isinstance(data, list):
@@ -251,42 +270,56 @@ class S3FillsService:
         hour: int,
         target_address: str,
     ) -> list[dict]:
-        """Fetch fills for a specific hour, trying multiple sources"""
+        """Fetch fills for a specific hour from the best available source.
+
+        OPTIMIZATION: Only try ONE data source per hour (the best one for that date).
+        Don't fall back to other sources just because no fills were found - that's
+        expected for most hours where the user didn't trade.
+        """
         dt = datetime.strptime(date_str, "%Y%m%d").replace(hour=hour, tzinfo=UTC)
 
-        # Try sources in priority order
-        sources_to_try = []
+        # Find the best (highest priority) source for this date
+        best_source = None
+        best_priority = float('inf')
         for name, config in DATA_SOURCES.items():
-            if dt >= config["start_date"]:
-                sources_to_try.append((config["priority"], name, config))
+            if dt >= config["start_date"] and config["priority"] < best_priority:
+                best_priority = config["priority"]
+                best_source = (name, config)
 
-        sources_to_try.sort()
+        if best_source is None:
+            return []
 
-        for _, source_name, config in sources_to_try:
-            key = f"{config['prefix']}/{date_str}/{hour}.lz4"
+        source_name, config = best_source
 
-            content = self._download_file(key)
-            if content is None:
-                continue
+        # Only use zero-padded format (standard S3 format)
+        # Non-padded format was never actually used in production data
+        key = f"{config['prefix']}/{date_str}/{hour:02d}.lz4"
+        content = self._download_file(key)
 
-            if config["format"] == "fills":
-                fills = self._parse_fills_file(content, target_address)
-            else:
-                fills = self._parse_trades_file(content, target_address)
+        if content is None:
+            # File doesn't exist or download failed - this is normal for some hours
+            return []
 
-            if fills:
-                logger.debug(
-                    "Found %d fills from %s for %s/%d", len(fills), source_name, date_str, hour
-                )
-                return fills
+        # Parse based on format
+        if config["format"] == "fills":
+            fills = self._parse_fills_file(content, target_address)
+        else:
+            fills = self._parse_trades_file(content, target_address)
 
-        return []
+        if fills:
+            logger.debug(
+                "Found %d fills from %s for %s/%d", len(fills), source_name, date_str, hour
+            )
+
+        return fills
 
     async def fetch_fills_range(
         self,
         address: str,
         start_time: int,
         end_time: int | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
+        partial_result_callback: Callable[[list[dict], int, int], None] | None = None,
     ) -> list[dict]:
         """
         Fetch fills for an address within a time range from S3.
@@ -296,10 +329,16 @@ class S3FillsService:
         - node_fills: 2025-05-25+
         - node_trades: 2025-03-22+
 
+        OPTIMIZATION: Fetches newest data first (progressive loading) so users can
+        see recent results quickly while older data continues loading.
+
         Args:
             address: Wallet address
             start_time: Start timestamp in milliseconds
             end_time: End timestamp in milliseconds (default: now)
+            progress_callback: Optional callback(completed, total) for progress updates
+            partial_result_callback: Optional callback(fills_so_far, completed, total)
+                                     for progressive results display
 
         Returns:
             List of fill records matching the address
@@ -332,21 +371,33 @@ class S3FillsService:
             hours_to_query.append((date_str, current.hour))
             current += timedelta(hours=1)
 
+        # OPTIMIZATION: Reverse order to fetch newest data first (progressive loading)
+        # Users can see recent results quickly while older data continues loading
+        hours_to_query.reverse()
+
+        total_hours = len(hours_to_query)
         logger.info(
-            "S3 fills query: address=%s, range=%s to %s, hours=%d",
+            "S3 fills query: address=%s, range=%s to %s, hours=%d (newest first)",
             address[:10],
             start_dt.isoformat(),
             end_dt.isoformat(),
-            len(hours_to_query),
+            total_hours,
         )
 
-        # Fetch in parallel
+        # Fetch all hours in parallel - ThreadPoolExecutor limits actual concurrency
         loop = asyncio.get_event_loop()
         all_fills: list[dict] = []
+        seen: set[str] = set()  # For deduplication
+        completed_count = 0
 
-        batch_size = 24
-        for i in range(0, len(hours_to_query), batch_size):
-            batch = hours_to_query[i : i + batch_size]
+        def _dedupe_key(fill: dict) -> str:
+            return fill.get("hash") or f"{fill.get('time')}:{fill.get('coin')}:{fill.get('oid')}"
+
+        # Process in batches to allow progress updates and partial results
+        batch_size = 200  # Process 200 hours at a time (matches thread pool capacity)
+        for batch_start in range(0, total_hours, batch_size):
+            batch_end = min(batch_start + batch_size, total_hours)
+            batch = hours_to_query[batch_start:batch_end]
 
             tasks = [
                 loop.run_in_executor(
@@ -362,32 +413,44 @@ class S3FillsService:
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for result in results:
                 if isinstance(result, list):
-                    all_fills.extend(result)
+                    for fill in result:
+                        # Filter by time range and deduplicate on the fly
+                        fill_time = fill.get("time")
+                        if fill_time is None:
+                            continue
+                        try:
+                            t = int(fill_time)
+                        except (TypeError, ValueError):
+                            continue
+                        if start_time <= t <= end_time:
+                            key = _dedupe_key(fill)
+                            if key not in seen:
+                                seen.add(key)
+                                all_fills.append(fill)
                 elif isinstance(result, Exception):
                     logger.debug("S3 fetch error: %s", result)
 
-        # Filter by exact time range and deduplicate
-        filtered = []
-        seen: set[str] = set()
-        for fill in all_fills:
-            fill_time = fill.get("time")
-            if fill_time is None:
-                continue
-            try:
-                t = int(fill_time)
-            except (TypeError, ValueError):
-                continue
+            completed_count += len(batch)
+            if progress_callback:
+                try:
+                    progress_callback(completed_count, total_hours)
+                except Exception as e:
+                    logger.debug("Progress callback error: %s", e)
 
-            if start_time <= t <= end_time:
-                dedupe_key = fill.get("hash") or f"{t}:{fill.get('coin')}:{fill.get('oid')}"
-                if dedupe_key not in seen:
-                    seen.add(dedupe_key)
-                    filtered.append(fill)
+            # OPTIMIZATION: Provide partial results for progressive display
+            if partial_result_callback and all_fills:
+                try:
+                    # Sort current fills by time (newest first for display)
+                    sorted_partial = sorted(all_fills, key=lambda f: int(f.get("time", 0)), reverse=True)
+                    partial_result_callback(sorted_partial, completed_count, total_hours)
+                except Exception as e:
+                    logger.debug("Partial result callback error: %s", e)
 
-        filtered.sort(key=lambda f: int(f.get("time", 0)))
+        # Final sort by time (oldest first for consistency)
+        all_fills.sort(key=lambda f: int(f.get("time", 0)))
 
-        logger.info("S3 fills result: found %d fills for %s", len(filtered), address[:10])
-        return filtered
+        logger.info("S3 fills result: found %d fills for %s", len(all_fills), address[:10])
+        return all_fills
 
     async def check_availability(self) -> dict:
         """Check S3 data source availability"""

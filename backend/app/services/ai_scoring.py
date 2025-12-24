@@ -16,6 +16,15 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class ScoreBreakdownItem:
+    """Individual scoring factor"""
+
+    item: str
+    points: float
+    type: str  # "positive" or "negative"
+
+
+@dataclass
 class ModelScore:
     """Individual model scoring result"""
 
@@ -25,6 +34,8 @@ class ModelScore:
     reasoning: str
     model_name: str
     trading_tags: list[str]
+    score_breakdown: list[ScoreBreakdownItem] | None = None
+    data_coverage_warning: str | None = None
 
 
 SCORING_PROMPT = """You are a professional crypto trading analyst evaluating a trader for copy-trading suitability.
@@ -41,6 +52,8 @@ Analyze the following trader metrics and provide:
    - Direction bias: 做多为主(L/S>1.5), 做空为主(L/S<0.67), 多空均衡
    - Risk style: 激进(high DD), 稳健(low DD), 马丁(high trade count + losses)
    - Asset focus: 主流币(BTC/ETH heavy), 山寨币(altcoin heavy)
+6. If data_limited is True or trading_days < 180, add a data_coverage_warning in Chinese explaining the limitation
+7. **IMPORTANT**: Provide score_breakdown - a list of scoring factors with positive (加分) and negative (扣分) items in Chinese
 
 TRADER METRICS:
 - Address: {address}
@@ -55,11 +68,19 @@ TRADER METRICS:
 - Trade Frequency: {trade_frequency} trades/day
 - Avg Holding Time: {avg_holding_time} hours
 - Long/Short Ratio: {long_short_ratio}
+- Trading Days: {trading_days} (days since first trade)
 
 BACKTEST RESULTS (simulated with $10,000 fixed capital, proportional scaling):
 - 7-Day: ROE={bt_7d_roe}%, Max DD={bt_7d_dd}%
 - 30-Day: ROE={bt_30d_roe}%, Max DD={bt_30d_dd}%
 - 90-Day: ROE={bt_90d_roe}%, Max DD={bt_90d_dd}%
+
+DATA COVERAGE:
+- Data Limited: {data_limited}
+- Data Coverage Days: {data_coverage_days}
+- Trading Days: {trading_days}
+(If data_limited=True, only 90 days of data is available due to API limits for high-frequency traders)
+(If trading_days < 180, trader has NOT experienced a full market cycle - this is important for reliability assessment)
 
 IMPORTANT NOTES ON METRICS:
 1. ROE vs Backtest ROE difference is EXPECTED and NOT a data error:
@@ -73,15 +94,29 @@ IMPORTANT NOTES ON METRICS:
 2. Profit Factor capped at 100 (values above indicate near-zero losses, not data error)
 3. Win Rate of 100% with few trades may indicate insufficient sample size
 
-SCORING GUIDELINES:
-- Score 80+: Consistently profitable, low drawdown (<15%), high win rate (>55%), stable performance
+SCORING GUIDELINES (重要：回撤是跟单最大风险，权重应更高):
+- Score 80+: Consistently profitable, low drawdown (<15%), high win rate (>55%), stable performance, trading_days >= 180
 - Score 60-79: Generally profitable, moderate risk, some volatility
 - Score 40-59: Mixed results, higher risk, proceed with caution
-- Score 20-39: Poor performance or high risk indicators
-- Score 0-19: Severe losses, extreme drawdown, or insufficient data
+- Score 20-39: Poor performance or high risk indicators (drawdown >40% should strongly push toward this range)
+- Score 0-19: Severe losses, extreme drawdown (>50%), or insufficient data
+
+DRAWDOWN PENALTY GUIDANCE (回撤扣分参考):
+- <10%: +15分 (极好的风控)
+- 10-20%: +8分 (良好)
+- 20-30%: 0分 (中等)
+- 30-40%: -12分 (偏高)
+- 40-50%: -18分 (高风险)
+- >50%: -25分 (极高风险，跟单可能爆仓)
+
+DATA COVERAGE PENALTY (数据覆盖扣分):
+- <30天: -15分 (数据严重不足)
+- 30-90天: -8分 (样本有限)
+- 90-180天: -3分 (未经历完整周期)
+- >=365天: +5分 (数据可靠)
 
 Respond ONLY with valid JSON in this exact format:
-{{"score": <number>, "recommendation": "<string>", "risk_level": "<string>", "reasoning": "<Chinese text>", "trading_tags": ["tag1", "tag2", "tag3"]}}"""
+{{"score": <number>, "recommendation": "<string>", "risk_level": "<string>", "reasoning": "<Chinese text>", "trading_tags": ["tag1", "tag2", "tag3"], "data_coverage_warning": "<Chinese text or null if data is complete>", "score_breakdown": [{{"item": "<Chinese description>", "points": <positive or negative number>, "type": "positive" or "negative"}}]}}"""
 
 
 def _fmt(val, default: str = "N/A", fmt_str: str = "{}") -> str:
@@ -140,6 +175,9 @@ class AIScoringService:
                 "N/A",
                 "{:.1f}",
             ),
+            data_limited=result.data_limited,
+            data_coverage_days=result.data_coverage_days or "N/A",
+            trading_days=result.trading_days or "N/A",
         )
 
     def _parse_json_response(self, content: str) -> dict:
@@ -150,6 +188,22 @@ class AIScoringService:
             lines = [line for line in lines if not line.startswith("```")]
             content = "\n".join(lines)
         return json.loads(content)
+
+    def _parse_score_breakdown(self, raw_breakdown: list | None) -> list[ScoreBreakdownItem]:
+        """Parse score_breakdown from API response"""
+        if not raw_breakdown:
+            return []
+        result = []
+        for item in raw_breakdown:
+            try:
+                result.append(ScoreBreakdownItem(
+                    item=str(item.get("item", "")),
+                    points=float(item.get("points", 0)),
+                    type=str(item.get("type", "positive" if item.get("points", 0) >= 0 else "negative"))
+                ))
+            except (KeyError, ValueError, TypeError):
+                continue
+        return result
 
     async def _call_claude(self, prompt: str) -> ModelScore | None:
         """Call Claude API via Messages API"""
@@ -165,7 +219,7 @@ class AIScoringService:
         }
         payload = {
             "model": self.settings.claude_model,
-            "max_tokens": 500,
+            "max_tokens": 1000,
             "messages": [{"role": "user", "content": prompt}],
         }
 
@@ -178,6 +232,10 @@ class AIScoringService:
             content = data["content"][0]["text"]
             result = self._parse_json_response(content)
 
+            # Log score_breakdown for debugging
+            raw_breakdown = result.get("score_breakdown")
+            logger.info("Claude raw score_breakdown: %s", raw_breakdown)
+
             return ModelScore(
                 score=float(result["score"]),
                 recommendation=result["recommendation"],
@@ -185,6 +243,8 @@ class AIScoringService:
                 reasoning=result["reasoning"],
                 model_name="claude",
                 trading_tags=result.get("trading_tags", []),
+                score_breakdown=self._parse_score_breakdown(result.get("score_breakdown")),
+                data_coverage_warning=result.get("data_coverage_warning"),
             )
         except Exception as e:
             logger.error("Claude API call failed: %s", e)
@@ -204,7 +264,7 @@ class AIScoringService:
         }
         payload = {
             "model": self.settings.claude_haiku_model,
-            "max_tokens": 500,
+            "max_tokens": 1000,
             "messages": [{"role": "user", "content": prompt}],
         }
 
@@ -224,6 +284,8 @@ class AIScoringService:
                 reasoning=result["reasoning"],
                 model_name="haiku",
                 trading_tags=result.get("trading_tags", []),
+                score_breakdown=self._parse_score_breakdown(result.get("score_breakdown")),
+                data_coverage_warning=result.get("data_coverage_warning"),
             )
         except Exception as e:
             logger.error("Claude Haiku API call failed: %s", e)
@@ -243,7 +305,7 @@ class AIScoringService:
         payload = {
             "model": self.settings.openai_model,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 500,
+            "max_tokens": 1000,
             "response_format": {"type": "json_object"},
         }
 
@@ -263,6 +325,8 @@ class AIScoringService:
                 reasoning=result["reasoning"],
                 model_name="codex",
                 trading_tags=result.get("trading_tags", []),
+                score_breakdown=self._parse_score_breakdown(result.get("score_breakdown")),
+                data_coverage_warning=result.get("data_coverage_warning"),
             )
         except Exception as e:
             logger.error("OpenAI API call failed: %s", e)
@@ -335,6 +399,23 @@ class AIScoringService:
                     merged_tags.append(tag)
                     seen_tags.add(tag)
 
+        # Get data coverage warning from first model that has one
+        data_coverage_warning = None
+        for s in scores:
+            if s.data_coverage_warning:
+                data_coverage_warning = s.data_coverage_warning
+                break
+
+        # Merge score_breakdown from first model that has one (prefer Claude)
+        merged_breakdown = []
+        for s in scores:
+            if s.score_breakdown:
+                merged_breakdown = [
+                    {"item": b.item, "points": b.points, "type": b.type}
+                    for b in s.score_breakdown
+                ]
+                break
+
         # Determine which scores to store
         claude_score = None
         codex_score = None
@@ -350,82 +431,102 @@ class AIScoringService:
             risk_level=risk_level,
             reasoning=merged_reasoning,
             trading_tags=merged_tags[:5],
+            score_breakdown=merged_breakdown,
             claude_score=claude_score,
             codex_score=codex_score,
             models_used=[s.model_name for s in scores],
+            data_coverage_warning=data_coverage_warning,
         )
 
     def _fallback_evaluation(self, result: FullAnalysisResult) -> AIEvaluation:
         """Rule-based fallback evaluation"""
         score = 50.0
-        factors = []
+        score_breakdown = []
 
         if result.roe_30d is not None:
             if result.roe_30d > 50:
                 score += 15
-                factors.append("30天ROE优异(>50%)")
+                score_breakdown.append({"item": "30天ROE优异(>50%)", "points": 15, "type": "positive"})
             elif result.roe_30d > 20:
                 score += 10
-                factors.append("30天ROE良好(>20%)")
+                score_breakdown.append({"item": "30天ROE良好(>20%)", "points": 10, "type": "positive"})
             elif result.roe_30d > 0:
                 score += 5
-                factors.append("30天ROE为正")
+                score_breakdown.append({"item": "30天ROE为正", "points": 5, "type": "positive"})
             elif result.roe_30d < -20:
                 score -= 15
-                factors.append("30天ROE严重亏损(<-20%)")
+                score_breakdown.append({"item": "30天ROE严重亏损(<-20%)", "points": -15, "type": "negative"})
             else:
                 score -= 5
-                factors.append("30天ROE为负")
+                score_breakdown.append({"item": "30天ROE为负", "points": -5, "type": "negative"})
 
         if result.win_rate is not None:
             if result.win_rate > 60:
                 score += 10
-                factors.append("胜率高(>60%)")
+                score_breakdown.append({"item": "胜率高(>60%)", "points": 10, "type": "positive"})
             elif result.win_rate > 50:
                 score += 5
-                factors.append("胜率正常(>50%)")
+                score_breakdown.append({"item": "胜率正常(>50%)", "points": 5, "type": "positive"})
             elif result.win_rate < 40:
                 score -= 10
-                factors.append("胜率偏低(<40%)")
+                score_breakdown.append({"item": "胜率偏低(<40%)", "points": -10, "type": "negative"})
 
         if result.profit_factor is not None:
             if result.profit_factor > 2:
                 score += 10
-                factors.append("盈亏比优异(>2)")
+                score_breakdown.append({"item": "盈亏比优异(>2)", "points": 10, "type": "positive"})
             elif result.profit_factor > 1.5:
                 score += 5
-                factors.append("盈亏比良好(>1.5)")
+                score_breakdown.append({"item": "盈亏比良好(>1.5)", "points": 5, "type": "positive"})
             elif result.profit_factor < 1:
                 score -= 10
-                factors.append("盈亏比差(<1)")
+                score_breakdown.append({"item": "盈亏比差(<1)", "points": -10, "type": "negative"})
 
         if result.max_drawdown_pct is not None:
             dd = abs(result.max_drawdown_pct)
             if dd < 10:
-                score += 10
-                factors.append("回撤控制极好(<10%)")
+                score += 15
+                score_breakdown.append({"item": "回撤控制极好(<10%)", "points": 15, "type": "positive"})
             elif dd < 20:
-                score += 5
-                factors.append("回撤控制良好(<20%)")
+                score += 8
+                score_breakdown.append({"item": "回撤控制良好(<20%)", "points": 8, "type": "positive"})
             elif dd > 50:
-                score -= 15
-                factors.append("回撤过大(>50%)")
+                score -= 25
+                score_breakdown.append({"item": "回撤过大(>50%)，跟单风险极高", "points": -25, "type": "negative"})
+            elif dd > 40:
+                score -= 18
+                score_breakdown.append({"item": "回撤偏大(>40%)", "points": -18, "type": "negative"})
             elif dd > 30:
-                score -= 10
-                factors.append("回撤偏大(>30%)")
+                score -= 12
+                score_breakdown.append({"item": "回撤偏高(>30%)", "points": -12, "type": "negative"})
 
         if result.backtest_30d:
             if result.backtest_30d.roe > 10:
                 score += 5
-                factors.append("回测30天盈利(>10%)")
+                score_breakdown.append({"item": "回测30天盈利(>10%)", "points": 5, "type": "positive"})
             elif result.backtest_30d.roe < -10:
                 score -= 5
-                factors.append("回测30天亏损(<-10%)")
+                score_breakdown.append({"item": "回测30天亏损(<-10%)", "points": -5, "type": "negative"})
 
         if result.total_trades is not None:
             if result.total_trades < 10:
                 score -= 10
-                factors.append("交易次数过少，数据不足")
+                score_breakdown.append({"item": "交易次数过少，数据不足", "points": -10, "type": "negative"})
+
+        # Data coverage penalty (trading history duration)
+        if result.trading_days is not None:
+            if result.trading_days < 30:
+                score -= 15
+                score_breakdown.append({"item": "交易历史不足30天，评估可信度低", "points": -15, "type": "negative"})
+            elif result.trading_days < 90:
+                score -= 8
+                score_breakdown.append({"item": "交易历史不足90天，样本有限", "points": -8, "type": "negative"})
+            elif result.trading_days < 180:
+                score -= 3
+                score_breakdown.append({"item": "未经历完整市场周期(<180天)", "points": -3, "type": "negative"})
+            elif result.trading_days >= 365:
+                score += 5
+                score_breakdown.append({"item": "交易历史超过1年，数据可靠", "points": 5, "type": "positive"})
 
         score = max(0, min(100, score))
 
@@ -450,6 +551,8 @@ class AIScoringService:
         else:
             risk_level = "low"
 
+        # Generate reasoning from score_breakdown
+        factors = [b["item"] for b in score_breakdown]
         reasoning = "[FALLBACK] " + (
             "; ".join(factors) if factors else "数据不足，无法进行详细评估"
         )
@@ -490,15 +593,25 @@ class AIScoringService:
         elif dd < 15:
             tags.append("稳健")
 
+        # Generate data coverage warning if data is limited
+        data_coverage_warning = None
+        if result.data_limited:
+            data_coverage_warning = (
+                f"⚠️ 仅有{result.data_coverage_days or 90}天数据，该交易员为高频交易员(90天内>8000笔)，"
+                "完整历史数据需要额外时间获取。建议谨慎评估，可能无法观察到完整的牛熊周期表现。"
+            )
+
         return AIEvaluation(
             score=round(score, 1),
             recommendation=recommendation,
             risk_level=risk_level,
             reasoning=reasoning,
             trading_tags=tags[:5],
+            score_breakdown=score_breakdown,
             claude_score=None,
             codex_score=None,
             models_used=["fallback"],
+            data_coverage_warning=data_coverage_warning,
         )
 
 

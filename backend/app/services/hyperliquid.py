@@ -272,6 +272,111 @@ class HyperliquidService:
         return all_fills
 
 
+
+
+    async def get_cumulative_volume(self, address: str) -> float:
+        """Get cumulative trading volume from userRateLimit API"""
+        try:
+            data = await self._post({"type": "userRateLimit", "user": address.lower()})
+            return float(data.get("cumVlm", 0))
+        except Exception as e:
+            logger.warning("Failed to get cumulative volume for %s: %s", address[:10], e)
+            return 0.0
+
+    async def get_spot_state(self, address: str) -> dict:
+        """Get spot clearinghouse state"""
+        return await self._post({"type": "spotClearinghouseState", "user": address.lower()})
+
+    async def get_ledger_updates(self, address: str, start_time: int = 0) -> list[dict]:
+        """Get non-funding ledger updates (deposits, withdrawals, transfers)"""
+        return await self._post({
+            "type": "userNonFundingLedgerUpdates",
+            "user": address.lower(),
+            "startTime": start_time,
+        })
+
+    async def is_high_frequency_account(self, address: str, threshold: float = 1_000_000_000) -> bool:
+        """
+        Detect if account is high-frequency (>$1B cumulative volume).
+        High-frequency accounts may only return recent data from userFillsByTime API.
+        """
+        volume = await self.get_cumulative_volume(address)
+        is_hf = volume > threshold
+        if is_hf:
+            logger.info("High-frequency account detected: %s, volume=$%.2fB", address[:10], volume / 1e9)
+        return is_hf
+
+    async def calculate_pnl_from_deposits(self, address: str) -> dict:
+        """
+        Calculate PnL using deposit/withdrawal method for high-frequency accounts.
+        Formula: PnL = (Perp Account Value + Spot Value) - (Net Deposits)
+        """
+        addr_lower = address.lower()
+
+        perp_state = await self.get_user_state(addr_lower)
+        spot_state = await self.get_spot_state(addr_lower)
+        ledger = await self.get_ledger_updates(addr_lower, start_time=0)
+
+        perp_value = 0.0
+        for path in [("marginSummary", "accountValue"), ("crossMarginSummary", "accountValue")]:
+            cur = perp_state
+            for key in path:
+                if isinstance(cur, dict) and key in cur:
+                    cur = cur[key]
+                else:
+                    cur = None
+                    break
+            if cur is not None:
+                try:
+                    perp_value = float(cur)
+                    break
+                except (TypeError, ValueError):
+                    pass
+
+        spot_value = 0.0
+        spot_balances = spot_state.get("balances", [])
+        for bal in spot_balances:
+            try:
+                token = bal.get("coin", "")
+                total = float(bal.get("total", 0))
+                if token in ("USDC", "USDT", "USD"):
+                    spot_value += total
+            except (TypeError, ValueError):
+                pass
+
+        total_deposits = 0.0
+        total_withdrawals = 0.0
+        for entry in ledger:
+            delta = entry.get("delta", {})
+            entry_type = delta.get("type", "")
+            try:
+                usdc = float(delta.get("usdc", 0))
+                if entry_type == "deposit":
+                    total_deposits += usdc
+                elif entry_type == "withdraw":
+                    total_withdrawals += usdc
+            except (TypeError, ValueError):
+                pass
+
+        net_deposits = total_deposits - total_withdrawals
+        current_value = perp_value + spot_value
+        total_pnl = current_value - net_deposits
+
+        logger.info(
+            "PnL calculation for %s: perp=$%.2f, spot=$%.2f, deposits=$%.2f, withdrawals=$%.2f, pnl=$%.2f",
+            addr_lower[:10], perp_value, spot_value, total_deposits, total_withdrawals, total_pnl
+        )
+
+        return {
+            "total_pnl": total_pnl,
+            "perp_value": perp_value,
+            "spot_value": spot_value,
+            "total_deposits": total_deposits,
+            "total_withdrawals": total_withdrawals,
+            "net_deposits": net_deposits,
+            "method": "deposit_based",
+        }
+
 class SuperXService:
     """SuperX API service for trader stats"""
 

@@ -135,8 +135,14 @@ def run_backtest(
     """
     Run backtest by scaling trader's historical trades proportionally.
 
-    The scale ensures every trade meets HyperLiquid's minimum position size (11 USDT).
-    Small capital can still follow every trade.
+    The backtest simulates what would happen if a user followed this trader
+    with the specified capital. Key principle: the user's ROE should match
+    the trader's ROE (proportional following).
+
+    - simulated_pnl: User's absolute profit (scaled by capital ratio)
+    - simulated_roe: Should match trader's ROE (pnl/account_value * 100)
+
+    Trades with notional < min_position_usdt are skipped (HyperLiquid minimum).
     """
     if capital <= 0:
         raise ValueError("capital must be > 0")
@@ -148,24 +154,9 @@ def run_backtest(
         key=lambda f: _to_int_ms(f.get("time")) or 0,
     )
 
-    # Find the smallest trade notional that's above the min threshold
-    min_notional = float("inf")
-    for f in sorted_fills:
-        px = _to_float(f.get("px"), default=0.0)
-        sz = _to_float(f.get("sz"), default=0.0)
-        notional = abs(px * sz)
-        # Only consider trades that won't be skipped
-        if notional >= min_position_usdt:
-            min_notional = min(min_notional, notional)
-
-    # Calculate scale: ensure smallest trade >= min_position_usdt after scaling
+    # base_scale: the ratio of user's capital to trader's account
+    # PnL is scaled proportionally - if trader earns 10%, user earns 10%
     base_scale = float(capital) / float(account_value)
-
-    if min_notional != float("inf") and min_notional > 0:
-        min_required_scale = float(min_position_usdt) / min_notional
-        scale = max(base_scale, min_required_scale)
-    else:
-        scale = base_scale
 
     equity = float(capital)
     points: list[EquityPoint] = []
@@ -196,12 +187,17 @@ def run_backtest(
         )
         fee = _to_float(f.get("fee"), default=0.0)
 
-        equity += (closed_pnl - fee) * scale
+        equity += (closed_pnl - fee) * base_scale
         points.append(EquityPoint(time_ms=int(t), equity=float(equity)))
         trade_count += 1
 
+    # Calculate trader's actual PnL (unscaled) for ROE calculation
+    trader_pnl = float(equity - float(capital)) / base_scale if base_scale > 0 else 0.0
+
     simulated_pnl = float(equity - float(capital))
-    simulated_roe = float((simulated_pnl / float(capital)) * 100.0)
+    # ROE should reflect trader's performance: trader_pnl / account_value
+    # This ensures backtest ROE matches the stats ROE
+    simulated_roe = float((trader_pnl / float(account_value)) * 100.0) if account_value > 0 else 0.0
 
     max_drawdown, max_drawdown_pct, drawdown_periods = _compute_drawdowns(points)
 
@@ -215,6 +211,6 @@ def run_backtest(
         drawdown_periods=drawdown_periods,
         trade_count=int(trade_count),
         skipped_trade_count=int(skipped_count),
-        scale=round(float(scale), 6),
+        scale=round(float(base_scale), 6),
         baseline_account_value=round(float(account_value), 2),
     )

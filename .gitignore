@@ -1,12 +1,8 @@
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
-
-# Distribution / packaging
 .Python
 build/
 develop-eggs/
@@ -24,90 +20,46 @@ wheels/
 .installed.cfg
 *.egg
 
-# PyInstaller
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-
-# Translations
-*.mo
-*.pot
-
-# Environments
-.env
-.venv
-env/
+# Virtual environments
 venv/
 ENV/
-env.bak/
-venv.bak/
+env/
+.venv/
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
-*~
+
+# Environment
+.env
+.env.local
+*.pem
+
+# Database
+*.db
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# pytest
+.pytest_cache/
 
 # mypy
 .mypy_cache/
-.dmypy.json
-dmypy.json
 
-# ruff
-.ruff_cache/
-
-# Frontend
-node_modules/
-frontend/dist/
-frontend/.nuxt/
-frontend/.output/
-.npm
+# Docker
+.docker/
 
 # OS
 .DS_Store
 Thumbs.db
-
-# Project specific
-*.log
-*.csv
-*.json
-!package.json
-!package-lock.json
-!tsconfig.json
-portfolio_raw.json
-analysis_report.json
-trades.csv
-*.db
-
-# Test files (temporary)
-backend/test_*.py
-!backend/tests/test_*.py
-
-# Startup scripts (local only)
-*.bat
-*.vbs
-*.ps1
-
-# Secrets
-.env.local
-.env.*.local
-*.pem
-*.key
