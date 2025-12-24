@@ -1,25 +1,36 @@
+# Pre-commit hooks - 技术强制层
+# 任何 commit 前必须通过这些检查
+
 repos:
+  # Ruff - 快速 Python linter
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.1.6
+    rev: v0.8.4
     hooks:
       - id: ruff
-        args: [--fix]
+        args: [--fix, --exit-non-zero-on-fix]
+        files: ^backend/
       - id: ruff-format
+        files: ^backend/
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.7.1
-    hooks:
-      - id: mypy
-        additional_dependencies:
-          - types-requests
-          - pydantic
-        args: [--ignore-missing-imports]
-
+  # 基础检查
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.5.0
+    rev: v5.0.0
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
       - id: check-added-large-files
-      - id: check-merge-conflict
+        args: [--maxkb=500]
+
+  # 测试 - 本地 hook (核心测试)
+  - repo: local
+    hooks:
+      - id: pytest-check
+        name: pytest (critical tests)
+        entry: bash -c 'cd backend && python -m pytest tests/test_schemas.py tests/test_analyzer.py tests/test_backtest.py -q --tb=no'
+        language: system
+        pass_filenames: false
+        files: ^backend/.*\.py$
+
+default_language_version:
+  python: python3.12

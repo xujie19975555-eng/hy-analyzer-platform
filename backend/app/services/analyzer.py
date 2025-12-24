@@ -1,6 +1,11 @@
-import pandas as pd
-from typing import Optional
+from __future__ import annotations
+
+from collections import defaultdict, deque
+from collections.abc import Mapping
 from datetime import datetime
+from typing import Any
+
+import pandas as pd
 
 from app.models.schemas import PerformanceSummary, TraderStats
 
@@ -20,8 +25,201 @@ def parse_superx_stats(address: str, data: dict) -> TraderStats:
         win_rate=data.get("winRate"),
         profit_factor=data.get("profitFactorAll"),
         max_drawdown_pct=data.get("maxDrawdownPercentAll"),
-        total_trades=data.get("tradeCount")
+        total_trades=data.get("tradeCount"),
     )
+
+
+def _to_int_ms(v: Any) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_buy(side: Any) -> bool:
+    s = str(side).strip().lower()
+    return s in {"b", "buy", "long"}
+
+
+def _compute_avg_holding_time_seconds(
+    fills_sorted: list[Mapping[str, Any]],
+    close_time_start_ms: int,
+) -> float | None:
+    """
+    FIFO lot matching per-coin to compute average holding time.
+    Only counts closes where close time >= close_time_start_ms.
+    Weighted by entry notional.
+    """
+    long_lots: dict[str, deque[tuple[int, float, float]]] = defaultdict(deque)
+    short_lots: dict[str, deque[tuple[int, float, float]]] = defaultdict(deque)
+
+    weighted_seconds = 0.0
+    weighted_notional = 0.0
+
+    for f in fills_sorted:
+        t = _to_int_ms(f.get("time"))
+        if t is None:
+            continue
+        coin = str(f.get("coin") or "UNKNOWN")
+        px = _to_float(f.get("px"), default=0.0)
+        sz = abs(_to_float(f.get("sz"), default=0.0))
+        if px <= 0 or sz <= 0:
+            continue
+
+        if _is_buy(f.get("side")):
+            remaining = sz
+            q = short_lots[coin]
+            while remaining > 0 and q:
+                entry_ms, entry_px, entry_sz = q[0]
+                matched = min(remaining, entry_sz)
+                entry_notional = matched * entry_px
+                if t >= close_time_start_ms:
+                    weighted_seconds += ((t - entry_ms) / 1000.0) * entry_notional
+                    weighted_notional += entry_notional
+                entry_sz -= matched
+                remaining -= matched
+                if entry_sz <= 1e-12:
+                    q.popleft()
+                else:
+                    q[0] = (entry_ms, entry_px, entry_sz)
+            if remaining > 0:
+                long_lots[coin].append((t, px, remaining))
+        else:
+            remaining = sz
+            q = long_lots[coin]
+            while remaining > 0 and q:
+                entry_ms, entry_px, entry_sz = q[0]
+                matched = min(remaining, entry_sz)
+                entry_notional = matched * entry_px
+                if t >= close_time_start_ms:
+                    weighted_seconds += ((t - entry_ms) / 1000.0) * entry_notional
+                    weighted_notional += entry_notional
+                entry_sz -= matched
+                remaining -= matched
+                if entry_sz <= 1e-12:
+                    q.popleft()
+                else:
+                    q[0] = (entry_ms, entry_px, entry_sz)
+            if remaining > 0:
+                short_lots[coin].append((t, px, remaining))
+
+    if weighted_notional <= 0:
+        return None
+    return float(weighted_seconds / weighted_notional)
+
+
+def _compute_simple_metrics(
+    fills_in_range: list[Mapping[str, Any]],
+    period_days: float,
+) -> dict[str, float | None]:
+    """Compute long_short_ratio, avg_trade_size, trade_frequency"""
+    if not fills_in_range or period_days <= 0:
+        return {
+            "long_short_ratio": None,
+            "avg_trade_size": None,
+            "trade_frequency": None,
+        }
+
+    long_notional = 0.0
+    short_notional = 0.0
+    total_notional = 0.0
+    trade_count = 0
+
+    for f in fills_in_range:
+        px = _to_float(f.get("px"), default=0.0)
+        sz = _to_float(f.get("sz"), default=0.0)
+        notional = abs(px * sz)
+        if notional <= 0:
+            continue
+        total_notional += notional
+        trade_count += 1
+        if _is_buy(f.get("side")):
+            long_notional += notional
+        else:
+            short_notional += notional
+
+    if trade_count == 0:
+        return {
+            "long_short_ratio": None,
+            "avg_trade_size": None,
+            "trade_frequency": None,
+        }
+
+    long_short_ratio = None
+    if short_notional > 0:
+        long_short_ratio = float(long_notional / short_notional)
+
+    avg_trade_size = float(total_notional / trade_count)
+    trade_frequency = float(trade_count / period_days)
+
+    return {
+        "long_short_ratio": long_short_ratio,
+        "avg_trade_size": avg_trade_size,
+        "trade_frequency": trade_frequency,
+    }
+
+
+def compute_trade_metrics_timeframes(
+    fills: list[Mapping[str, Any]],
+    now_ms: int | None = None,
+) -> dict[str, float | None]:
+    """
+    Compute fill-derived metrics for 7d/30d/90d/all_time:
+    - long_short_ratio_*
+    - avg_trade_size_*
+    - avg_holding_time_* (seconds)
+    - trade_frequency_* (trades per day)
+    """
+    if now_ms is None:
+        now_ms = int(datetime.utcnow().timestamp() * 1000)
+
+    fills_sorted = sorted(fills, key=lambda f: _to_int_ms(f.get("time")) or 0)
+
+    def _in_range(f: Mapping[str, Any], start_ms: int, end_ms: int) -> bool:
+        t = _to_int_ms(f.get("time"))
+        return t is not None and start_ms <= t <= end_ms
+
+    timeframes: list[tuple[str, int, float]] = [
+        ("7d", now_ms - 7 * 86_400_000, 7.0),
+        ("30d", now_ms - 30 * 86_400_000, 30.0),
+        ("90d", now_ms - 90 * 86_400_000, 90.0),
+    ]
+
+    first_ms = _to_int_ms(fills_sorted[0].get("time")) if fills_sorted else None
+    last_ms = _to_int_ms(fills_sorted[-1].get("time")) if fills_sorted else None
+    if first_ms is not None and last_ms is not None and last_ms > first_ms:
+        all_days = max(1.0, (last_ms - first_ms) / 86_400_000.0)
+    else:
+        all_days = 1.0
+
+    out: dict[str, float | None] = {}
+
+    all_simple = _compute_simple_metrics(fills_sorted, period_days=all_days)
+    out["long_short_ratio_all_time"] = all_simple["long_short_ratio"]
+    out["avg_trade_size_all_time"] = all_simple["avg_trade_size"]
+    out["trade_frequency_all_time"] = all_simple["trade_frequency"]
+    out["avg_holding_time_all_time"] = _compute_avg_holding_time_seconds(
+        fills_sorted, close_time_start_ms=0
+    )
+
+    for label, start_ms, days in timeframes:
+        subset = [f for f in fills_sorted if _in_range(f, start_ms, now_ms)]
+        simple = _compute_simple_metrics(subset, period_days=days)
+        out[f"long_short_ratio_{label}"] = simple["long_short_ratio"]
+        out[f"avg_trade_size_{label}"] = simple["avg_trade_size"]
+        out[f"trade_frequency_{label}"] = simple["trade_frequency"]
+        out[f"avg_holding_time_{label}"] = _compute_avg_holding_time_seconds(
+            fills_sorted, close_time_start_ms=start_ms
+        )
+
+    return out
 
 
 def analyze_trades(fills: list) -> PerformanceSummary:
@@ -72,5 +270,5 @@ def analyze_trades(fills: list) -> PerformanceSummary:
         winning_trades=winning_trades,
         losing_trades=losing_trades,
         first_trade=df["time"].min(),
-        last_trade=df["time"].max()
+        last_trade=df["time"].max(),
     )

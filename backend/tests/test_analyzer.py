@@ -1,6 +1,8 @@
 """Tests for analyzer service"""
+
 import pytest
-from app.services.analyzer import parse_superx_stats, analyze_trades
+
+from app.services.analyzer import analyze_trades, parse_superx_stats
 
 
 class TestParseSuperxStats:
@@ -20,7 +22,7 @@ class TestParseSuperxStats:
             "winRate": 77.63,
             "profitFactorAll": 2.29,
             "maxDrawdownPercentAll": 46.63,
-            "tradeCount": 1500
+            "tradeCount": 1500,
         }
         stats = parse_superx_stats("0xtest", data)
 
@@ -50,16 +52,18 @@ class TestAnalyzeTrades:
 
     def test_analyze_single_trade(self):
         """Should analyze single trade correctly"""
-        fills = [{
-            "time": 1700000000000,
-            "coin": "BTC",
-            "side": "B",
-            "px": "50000",
-            "sz": "0.1",
-            "closedPnl": "100.0",
-            "fee": "5.0",
-            "user": "0xtest"
-        }]
+        fills = [
+            {
+                "time": 1700000000000,
+                "coin": "BTC",
+                "side": "B",
+                "px": "50000",
+                "sz": "0.1",
+                "closedPnl": "100.0",
+                "fee": "5.0",
+                "user": "0xtest",
+            }
+        ]
         result = analyze_trades(fills)
 
         assert result.total_trades == 1

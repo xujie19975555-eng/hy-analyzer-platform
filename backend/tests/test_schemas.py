@@ -1,6 +1,8 @@
 """Tests for schemas validation"""
+
 import pytest
-from app.models.schemas import WalletAddress, TraderStats
+
+from app.models.schemas import TraderStats, WalletAddress
 
 
 class TestWalletAddress:
@@ -41,7 +43,7 @@ class TestTraderStats:
             address="0x6c06bfd51ea8032ddaeea8b69009417b54f3587b",
             roe_all_time=1650.29,
             pnl_all_time=1682095.47,
-            win_rate=77.63
+            win_rate=77.63,
         )
         assert stats.roe_all_time == 1650.29
         assert stats.pnl_all_time == 1682095.47

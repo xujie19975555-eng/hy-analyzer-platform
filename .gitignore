@@ -95,6 +95,16 @@ Thumbs.db
 portfolio_raw.json
 analysis_report.json
 trades.csv
+*.db
+
+# Test files (temporary)
+backend/test_*.py
+!backend/tests/test_*.py
+
+# Startup scripts (local only)
+*.bat
+*.vbs
+*.ps1
 
 # Secrets
 .env.local

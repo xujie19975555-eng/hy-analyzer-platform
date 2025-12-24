@@ -1,0 +1,1653 @@
+<script setup lang="ts">
+import { onMounted, computed, ref } from 'vue'
+import { useTraderStore } from '../stores/trader'
+import type { Recommendation, RiskLevel } from '../types'
+
+const store = useTraderStore()
+const statsPeriod = ref<'7d' | '30d' | '90d' | 'all'>('30d')
+
+const periodLabels: Record<string, string> = { '7d': '7天', '30d': '30天', '90d': '90天', 'all': '全部' }
+
+const currentRoe = computed(() => {
+  const a = store.analysis
+  if (!a) return null
+  if (statsPeriod.value === '7d') return a.roe_7d
+  if (statsPeriod.value === '90d') return a.roe_90d
+  if (statsPeriod.value === 'all') return a.roe_all_time
+  return a.roe_30d
+})
+
+const currentPnl = computed(() => {
+  const a = store.analysis
+  if (!a) return null
+  if (statsPeriod.value === '7d') return a.pnl_7d
+  if (statsPeriod.value === '90d') return a.pnl_90d
+  if (statsPeriod.value === 'all') return a.pnl_all_time
+  return a.pnl_30d
+})
+
+const shortAddress = computed(() => {
+  const addr = store.address
+  return addr ? `${addr.slice(0, 6)}...${addr.slice(-4)}` : ''
+})
+
+const recommendationText: Record<Recommendation, string> = {
+  strong_follow: '强烈推荐跟单',
+  follow: '推荐跟单',
+  neutral: '中性',
+  avoid: '不建议跟单',
+  strong_avoid: '强烈不建议'
+}
+
+const riskText: Record<RiskLevel, string> = {
+  low: '低风险',
+  medium: '中等风险',
+  high: '高风险',
+  extreme: '极高风险'
+}
+
+const recommendationClass = computed(() => {
+  const rec = store.analysis?.ai_evaluation?.recommendation
+  if (!rec) return ''
+  if (rec === 'strong_follow' || rec === 'follow') return 'positive'
+  if (rec === 'avoid' || rec === 'strong_avoid') return 'negative'
+  return ''
+})
+
+const riskClass = computed(() => {
+  const risk = store.analysis?.ai_evaluation?.risk_level
+  if (!risk) return ''
+  if (risk === 'low') return 'positive'
+  if (risk === 'high' || risk === 'extreme') return 'negative'
+  return ''
+})
+
+function formatNumber(val: number | null | undefined, decimals = 2): string {
+  if (val === null || val === undefined) return '-'
+  return val.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals })
+}
+
+function formatPercent(val: number | null | undefined): string {
+  if (val === null || val === undefined) return '-'
+  const sign = val >= 0 ? '+' : ''
+  return `${sign}${val.toFixed(2)}%`
+}
+
+function formatUSD(val: number | null | undefined): string {
+  if (val === null || val === undefined) return '-'
+  const sign = val >= 0 ? '+' : ''
+  return `${sign}$${Math.abs(val).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+}
+
+function formatTime(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined) return '-'
+  const minutes = seconds / 60
+  if (minutes < 60) return `${minutes.toFixed(0)}分钟`
+  const hours = minutes / 60
+  if (hours < 24) return `${hours.toFixed(1)}小时`
+  return `${(hours / 24).toFixed(1)}天`
+}
+
+function formatDateTime(isoString: string): string {
+  const date = new Date(isoString)
+  return date.toLocaleString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit'
+  })
+}
+
+// Score tier helper
+function getScoreTier(score: number | null): { label: string; class: string; icon: string } {
+  if (score === null) return { label: '待评', class: 'tier-pending', icon: '' }
+  if (score >= 80) return { label: '优秀', class: 'tier-elite', icon: '🏆' }
+  if (score >= 60) return { label: '良好', class: 'tier-good', icon: '⭐' }
+  if (score >= 40) return { label: '一般', class: 'tier-average', icon: '' }
+  return { label: '较差', class: 'tier-low', icon: '⚠️' }
+}
+
+// Data freshness helper
+function getDataFreshness(isoString: string): { label: string; class: string } {
+  const date = new Date(isoString)
+  const now = new Date()
+  const hoursOld = (now.getTime() - date.getTime()) / (1000 * 60 * 60)
+
+  if (hoursOld < 1) return { label: '刚刚', class: 'fresh' }
+  if (hoursOld < 24) return { label: `${Math.floor(hoursOld)}小时前`, class: 'fresh' }
+  const daysOld = Math.floor(hoursOld / 24)
+  if (daysOld < 7) return { label: `${daysOld}天前`, class: 'recent' }
+  if (daysOld < 30) return { label: `${daysOld}天前`, class: 'stale' }
+  return { label: `${daysOld}天前`, class: 'very-stale' }
+}
+
+// Sortable column helper
+function getSortIcon(field: string): string {
+  if (store.historySortBy !== field) return '↕'
+  return store.historySortOrder === 'desc' ? '↓' : '↑'
+}
+
+function getTagClass(tag: string): string {
+  const tagClasses: Record<string, string> = {
+    '小资金': 'tag-capital-small',
+    '中等资金': 'tag-capital-medium',
+    '大资金': 'tag-capital-large',
+    '高频': 'tag-freq-high',
+    '中频': 'tag-freq-medium',
+    '低频': 'tag-freq-low',
+    '短线': 'tag-hold-short',
+    '中线': 'tag-hold-medium',
+    '长线': 'tag-hold-long',
+    '做多为主': 'tag-bias-long',
+    '做空为主': 'tag-bias-short',
+    '多空均衡': 'tag-bias-balanced',
+    '激进': 'tag-risk-aggressive',
+    '稳健': 'tag-risk-stable',
+    '马丁': 'tag-strategy-martin',
+    '主流币': 'tag-asset-major',
+    '山寨币': 'tag-asset-alt',
+  }
+  return tagClasses[tag] || 'tag-default'
+}
+
+function handleAnalyze() {
+  store.startAnalysis()
+}
+
+function handleForceRefresh() {
+  store.startAnalysis(true)
+}
+
+// Parse AI reasoning to separate model responses
+function parseReasoning(reasoning: string): { model: string; modelLabel: string; text: string }[] {
+  const parts: { model: string; modelLabel: string; text: string }[] = []
+
+  // Pattern: [MODEL] text | [MODEL2] text
+  const regex = /\[([A-Z]+)\]\s*([^|[\]]+)/g
+  let match
+
+  while ((match = regex.exec(reasoning)) !== null) {
+    const modelName = match[1]?.toLowerCase() ?? ''
+    const text = match[2]?.trim() ?? ''
+    let modelLabel = modelName.toUpperCase()
+
+    if (modelName === 'claude') modelLabel = 'Claude Sonnet'
+    else if (modelName === 'haiku') modelLabel = 'Claude Haiku'
+    else if (modelName === 'codex') modelLabel = 'GPT-4'
+    else if (modelName === 'fallback') modelLabel = '规则评分'
+
+    parts.push({ model: modelName, modelLabel, text })
+  }
+
+  // If no pattern matched, return the whole text
+  if (parts.length === 0 && reasoning) {
+    parts.push({ model: 'default', modelLabel: 'AI', text: reasoning })
+  }
+
+  return parts
+}
+
+function getModalRiskClass(risk: string): string {
+  if (risk === 'low') return 'positive'
+  if (risk === 'high' || risk === 'extreme') return 'negative'
+  return ''
+}
+
+async function handleDeleteTrader(address: string) {
+  console.log('[UI] Delete clicked:', address)
+  const shortAddr = `${address.slice(0, 6)}...${address.slice(-4)}`
+
+  // Use a simple confirm, log if it returns false
+  const confirmed = window.confirm(`确定要删除 ${shortAddr} 的分析记录吗？`)
+  console.log('[UI] Confirm result:', confirmed)
+
+  if (confirmed) {
+    console.log('[UI] User confirmed, calling store.deleteFromHistory...')
+    try {
+      const result = await store.deleteFromHistory(address)
+      console.log('[UI] Delete result:', result)
+      if (result) {
+        console.log('[UI] Delete successful')
+      } else {
+        console.log('[UI] Delete returned false')
+        alert('删除失败，请重试')
+      }
+    } catch (e) {
+      console.error('[UI] Delete error:', e)
+      alert('删除出错：' + e)
+    }
+  } else {
+    console.log('[UI] User cancelled delete')
+  }
+}
+
+onMounted(() => {
+  store.fetchHistory()
+})
+</script>
+
+<template>
+  <div class="home">
+    <div class="hero">
+      <h1>HY 分析平台</h1>
+      <p class="subtitle">Hyperliquid 交易员智能分析与跟单建议</p>
+    </div>
+
+    <div class="input-section">
+      <div class="search-box">
+        <input
+          v-model="store.address"
+          type="text"
+          placeholder="输入交易员钱包地址 (0x...)"
+          :disabled="store.loading"
+          @keyup.enter="handleAnalyze"
+        />
+        <div class="capital-input">
+          <label>资金:</label>
+          <input
+            v-model.number="store.capital"
+            type="number"
+            min="100"
+            max="100000000"
+            :disabled="store.loading"
+          />
+          <span>USDT</span>
+        </div>
+        <button
+          @click="handleAnalyze"
+          :disabled="store.loading || !store.isValidAddress"
+          :class="{ loading: store.loading }"
+        >
+          {{ store.loading ? '分析中...' : '开始分析' }}
+        </button>
+      </div>
+      <p v-if="store.error" class="error">{{ store.error }}</p>
+    </div>
+
+    <div v-if="store.loading" class="loading-section">
+      <div class="spinner"></div>
+      <p>正在分析交易员数据，请稍候...</p>
+      <p class="loading-hint">这可能需要 30-60 秒</p>
+    </div>
+
+    <div v-if="store.analysis" class="result-section">
+      <div class="result-header">
+        <div class="trader-info">
+          <h2>{{ shortAddress }}</h2>
+          <a :href="`https://app.hyperliquid.xyz/portfolio/${store.analysis.address}`" target="_blank">
+            在 Hyperliquid 查看 →
+          </a>
+        </div>
+        <div class="account-value" v-if="store.analysis.account_value">
+          <span class="label">账户价值</span>
+          <span class="value">${{ formatNumber(store.analysis.account_value) }}</span>
+        </div>
+      </div>
+
+      <div v-if="store.analysis.ai_evaluation" class="ai-section">
+        <h3>AI 跟单建议</h3>
+        <div class="ai-grid">
+          <div class="ai-card score">
+            <span class="ai-label">综合评分</span>
+            <span class="ai-value">{{ store.analysis.ai_evaluation.score.toFixed(1) }}</span>
+            <span class="ai-max">/100</span>
+          </div>
+          <div class="ai-card" :class="recommendationClass">
+            <span class="ai-label">跟单建议</span>
+            <span class="ai-value">{{ recommendationText[store.analysis.ai_evaluation.recommendation] }}</span>
+          </div>
+          <div class="ai-card" :class="riskClass">
+            <span class="ai-label">风险等级</span>
+            <span class="ai-value">{{ riskText[store.analysis.ai_evaluation.risk_level] }}</span>
+          </div>
+        </div>
+        <div v-if="store.analysis.ai_evaluation.trading_tags?.length" class="trading-tags">
+          <span class="tags-label">交易风格:</span>
+          <span
+            v-for="tag in store.analysis.ai_evaluation.trading_tags"
+            :key="tag"
+            class="trading-tag"
+            :class="getTagClass(tag)"
+          >{{ tag }}</span>
+        </div>
+        <div class="ai-reasoning">
+          <p>{{ store.analysis.ai_evaluation.reasoning }}</p>
+        </div>
+      </div>
+
+      <div class="stats-section">
+        <div class="stats-header">
+          <h3>统计数据</h3>
+          <div class="period-tabs">
+            <button v-for="p in (['7d', '30d', '90d', 'all'] as const)" :key="p" :class="['period-tab', { active: statsPeriod === p }]" @click="statsPeriod = p">{{ periodLabels[p] }}</button>
+          </div>
+        </div>
+        <div class="stats-grid">
+          <div class="stat-card" :class="{ positive: (currentRoe ?? 0) > 0, negative: (currentRoe ?? 0) < 0 }">
+            <span class="stat-label">收益率</span>
+            <span class="stat-value">{{ formatPercent(currentRoe) }}</span>
+          </div>
+          <div class="stat-card" :class="{ positive: (currentPnl ?? 0) > 0, negative: (currentPnl ?? 0) < 0 }">
+            <span class="stat-label">盈亏</span>
+            <span class="stat-value">{{ formatUSD(currentPnl) }}</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">胜率</span>
+            <span class="stat-value">{{ formatPercent(store.analysis.win_rate) }}</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">盈亏比</span>
+            <span class="stat-value">{{ formatNumber(store.analysis.profit_factor) }}</span>
+          </div>
+          <div class="stat-card negative">
+            <span class="stat-label">最大回撤</span>
+            <span class="stat-value">{{ formatPercent(store.analysis.max_drawdown_pct ? -store.analysis.max_drawdown_pct : null) }}</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">交易次数</span>
+            <span class="stat-value">{{ store.analysis.total_trades ?? '-' }}</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">多空比</span>
+            <span class="stat-value">{{ formatNumber(store.analysis.long_short_ratio) }}</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">平均交易规模</span>
+            <span class="stat-value">${{ formatNumber(store.analysis.avg_trade_size, 0) }}</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">平均持仓时间</span>
+            <span class="stat-value">{{ formatTime(store.analysis.avg_holding_time) }}</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="backtest-section">
+        <h3>回测模拟 ({{ store.capital.toLocaleString() }} USDT)</h3>
+        <div class="backtest-grid">
+          <div v-if="store.analysis.backtest_7d" class="backtest-card">
+            <span class="period">7天</span>
+            <span class="bt-value" :class="{ positive: store.analysis.backtest_7d.roe > 0, negative: store.analysis.backtest_7d.roe < 0 }">{{ formatPercent(store.analysis.backtest_7d.roe) }}</span>
+            <span class="bt-pnl">{{ formatUSD(store.analysis.backtest_7d.pnl) }}</span>
+            <span class="bt-dd">回撤: {{ formatPercent(store.analysis.backtest_7d.max_drawdown_pct ? -store.analysis.backtest_7d.max_drawdown_pct : null) }}</span>
+            <span class="bt-trades">{{ store.analysis.backtest_7d.trade_count }} 笔交易</span>
+          </div>
+          <div v-if="store.analysis.backtest_30d" class="backtest-card">
+            <span class="period">30天</span>
+            <span class="bt-value" :class="{ positive: store.analysis.backtest_30d.roe > 0, negative: store.analysis.backtest_30d.roe < 0 }">{{ formatPercent(store.analysis.backtest_30d.roe) }}</span>
+            <span class="bt-pnl">{{ formatUSD(store.analysis.backtest_30d.pnl) }}</span>
+            <span class="bt-dd">回撤: {{ formatPercent(store.analysis.backtest_30d.max_drawdown_pct ? -store.analysis.backtest_30d.max_drawdown_pct : null) }}</span>
+            <span class="bt-trades">{{ store.analysis.backtest_30d.trade_count }} 笔交易</span>
+          </div>
+          <div v-if="store.analysis.backtest_90d" class="backtest-card">
+            <span class="period">90天</span>
+            <span class="bt-value" :class="{ positive: store.analysis.backtest_90d.roe > 0, negative: store.analysis.backtest_90d.roe < 0 }">{{ formatPercent(store.analysis.backtest_90d.roe) }}</span>
+            <span class="bt-pnl">{{ formatUSD(store.analysis.backtest_90d.pnl) }}</span>
+            <span class="bt-dd">回撤: {{ formatPercent(store.analysis.backtest_90d.max_drawdown_pct ? -store.analysis.backtest_90d.max_drawdown_pct : null) }}</span>
+            <span class="bt-trades">{{ store.analysis.backtest_90d.trade_count }} 笔交易</span>
+          </div>
+          <div v-if="store.analysis.backtest_all_time" class="backtest-card highlight">
+            <span class="period">全部时间</span>
+            <span class="bt-value" :class="{ positive: store.analysis.backtest_all_time.roe > 0, negative: store.analysis.backtest_all_time.roe < 0 }">{{ formatPercent(store.analysis.backtest_all_time.roe) }}</span>
+            <span class="bt-pnl">{{ formatUSD(store.analysis.backtest_all_time.pnl) }}</span>
+            <span class="bt-dd">回撤: {{ formatPercent(store.analysis.backtest_all_time.max_drawdown_pct ? -store.analysis.backtest_all_time.max_drawdown_pct : null) }}</span>
+            <span class="bt-trades">{{ store.analysis.backtest_all_time.trade_count }} 笔交易</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="analyzed-time">
+        <span v-if="store.fromCache" class="cache-badge">缓存数据</span>
+        分析时间: {{ formatDateTime(store.analysis.analyzed_at) }}
+        <button
+          v-if="store.fromCache"
+          class="refresh-btn"
+          @click="handleForceRefresh"
+          :disabled="store.loading"
+        >
+          刷新数据
+        </button>
+      </div>
+    </div>
+
+    <div v-if="store.history.length > 0" class="history-section">
+      <h3>交易员排行榜 <span class="history-hint">（按AI评分排序）</span></h3>
+      <table class="history-table">
+        <thead>
+          <tr>
+            <th class="rank-col">#</th>
+            <th>地址</th>
+            <th class="sortable" @click="store.setHistorySort('account_value')">
+              账户价值 <span class="sort-icon">{{ getSortIcon('account_value') }}</span>
+            </th>
+            <th class="sortable" @click="store.setHistorySort('roe_30d')">
+              30天ROE <span class="sort-icon">{{ getSortIcon('roe_30d') }}</span>
+            </th>
+            <th class="sortable" @click="store.setHistorySort('ai_score')">
+              AI评分 <span class="sort-icon">{{ getSortIcon('ai_score') }}</span>
+            </th>
+            <th>建议</th>
+            <th>交易风格</th>
+            <th class="sortable" @click="store.setHistorySort('analyzed_at')">
+              数据时间 <span class="sort-icon">{{ getSortIcon('analyzed_at') }}</span>
+            </th>
+            <th class="action-col">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr
+            v-for="(item, index) in store.history"
+            :key="item.address"
+            @click="store.setAddress(item.address)"
+            class="clickable"
+          >
+            <td class="rank-col">
+              <span v-if="index === 0" class="rank-badge gold">🥇</span>
+              <span v-else-if="index === 1" class="rank-badge silver">🥈</span>
+              <span v-else-if="index === 2" class="rank-badge bronze">🥉</span>
+              <span v-else class="rank-num">{{ index + 1 }}</span>
+            </td>
+            <td class="address">{{ item.address.slice(0, 6) }}...{{ item.address.slice(-4) }}</td>
+            <td>{{ item.account_value ? `$${formatNumber(item.account_value)}` : '-' }}</td>
+            <td :class="{ positive: (item.roe_30d ?? 0) > 0, negative: (item.roe_30d ?? 0) < 0 }">
+              {{ formatPercent(item.roe_30d) }}
+            </td>
+            <td>
+              <span
+                class="score-badge clickable-score"
+                :class="getScoreTier(item.ai_score).class"
+                @click.stop="store.showTraderDetail(item.address)"
+                title="点击查看AI详细评价"
+              >
+                {{ getScoreTier(item.ai_score).icon }}
+                {{ item.ai_score ? item.ai_score.toFixed(1) : '-' }}
+                <span class="tier-label">{{ getScoreTier(item.ai_score).label }}</span>
+              </span>
+            </td>
+            <td>{{ item.ai_recommendation ? recommendationText[item.ai_recommendation as Recommendation] : '-' }}</td>
+            <td class="tags-cell">
+              <span
+                v-for="tag in item.trading_tags?.slice(0, 3)"
+                :key="tag"
+                class="trading-tag-mini"
+                :class="getTagClass(tag)"
+              >{{ tag }}</span>
+              <span v-if="!item.trading_tags?.length">-</span>
+            </td>
+            <td>
+              <span class="freshness" :class="getDataFreshness(item.analyzed_at).class">
+                {{ getDataFreshness(item.analyzed_at).label }}
+              </span>
+            </td>
+            <td class="action-col">
+              <button
+                class="delete-btn"
+                @click.stop="handleDeleteTrader(item.address)"
+                title="删除此交易员记录"
+              >
+                ✕
+              </button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- AI Evaluation Detail Modal -->
+    <div v-if="store.modalVisible" class="modal-overlay" @click.self="store.closeModal">
+      <div class="modal-content">
+        <button class="modal-close" @click="store.closeModal">&times;</button>
+
+        <div v-if="store.modalLoading" class="modal-loading">
+          <div class="spinner"></div>
+          <p>加载中...</p>
+        </div>
+
+        <div v-else-if="store.modalData" class="modal-body">
+          <div class="modal-header">
+            <h2>AI 详细评价</h2>
+            <a
+              :href="`https://app.hyperliquid.xyz/portfolio/${store.modalData.address}`"
+              target="_blank"
+              class="address-link"
+            >
+              {{ store.modalData.address.slice(0, 10) }}...{{ store.modalData.address.slice(-6) }}
+            </a>
+          </div>
+
+          <div v-if="store.modalData.ai_evaluation" class="modal-ai-section">
+            <!-- Score Summary -->
+            <div class="modal-score-row">
+              <div class="modal-score-card">
+                <span class="score-label">综合评分</span>
+                <span class="score-value" :class="getScoreTier(store.modalData.ai_evaluation.score).class">
+                  {{ store.modalData.ai_evaluation.score.toFixed(1) }}
+                </span>
+                <span class="score-tier">{{ getScoreTier(store.modalData.ai_evaluation.score).label }}</span>
+              </div>
+              <div class="modal-meta">
+                <div class="meta-item">
+                  <span class="meta-label">建议</span>
+                  <span class="meta-value" :class="recommendationClass">
+                    {{ recommendationText[store.modalData.ai_evaluation.recommendation] }}
+                  </span>
+                </div>
+                <div class="meta-item">
+                  <span class="meta-label">风险</span>
+                  <span class="meta-value" :class="getModalRiskClass(store.modalData.ai_evaluation.risk_level)">
+                    {{ riskText[store.modalData.ai_evaluation.risk_level] }}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Trading Tags -->
+            <div v-if="store.modalData.ai_evaluation.trading_tags?.length" class="modal-tags">
+              <span class="tags-title">交易风格</span>
+              <div class="tags-list">
+                <span
+                  v-for="tag in store.modalData.ai_evaluation.trading_tags"
+                  :key="tag"
+                  class="trading-tag"
+                  :class="getTagClass(tag)"
+                >{{ tag }}</span>
+              </div>
+            </div>
+
+            <!-- AI Reasoning -->
+            <div class="modal-reasoning">
+              <h4>AI 分析详情</h4>
+              <div class="reasoning-content">
+                <div
+                  v-for="(part, index) in parseReasoning(store.modalData.ai_evaluation.reasoning)"
+                  :key="index"
+                  class="reasoning-block"
+                  :class="part.model"
+                >
+                  <span class="model-badge">{{ part.modelLabel }}</span>
+                  <p>{{ part.text }}</p>
+                </div>
+              </div>
+            </div>
+
+            <!-- Key Metrics -->
+            <div class="modal-metrics">
+              <h4>关键指标</h4>
+              <div class="metrics-grid">
+                <div class="metric-item"><span class="metric-label">账户价值</span><span class="metric-value">${{ formatNumber(store.modalData.account_value) }}</span></div>
+                <div class="metric-item"><span class="metric-label">7天收益率</span><span class="metric-value" :class="{ positive: (store.modalData.roe_7d ?? 0) > 0, negative: (store.modalData.roe_7d ?? 0) < 0 }">{{ formatPercent(store.modalData.roe_7d) }}</span></div>
+                <div class="metric-item"><span class="metric-label">30天收益率</span><span class="metric-value" :class="{ positive: (store.modalData.roe_30d ?? 0) > 0, negative: (store.modalData.roe_30d ?? 0) < 0 }">{{ formatPercent(store.modalData.roe_30d) }}</span></div>
+                <div class="metric-item"><span class="metric-label">90天收益率</span><span class="metric-value" :class="{ positive: (store.modalData.roe_90d ?? 0) > 0, negative: (store.modalData.roe_90d ?? 0) < 0 }">{{ formatPercent(store.modalData.roe_90d) }}</span></div>
+                <div class="metric-item"><span class="metric-label">全部收益率</span><span class="metric-value" :class="{ positive: (store.modalData.roe_all_time ?? 0) > 0, negative: (store.modalData.roe_all_time ?? 0) < 0 }">{{ formatPercent(store.modalData.roe_all_time) }}</span></div>
+                <div class="metric-item"><span class="metric-label">胜率</span><span class="metric-value">{{ formatPercent(store.modalData.win_rate) }}</span></div>
+                <div class="metric-item"><span class="metric-label">最大回撤</span><span class="metric-value negative">{{ formatPercent(store.modalData.max_drawdown_pct ? -Math.abs(store.modalData.max_drawdown_pct) : null) }}</span></div>
+                <div class="metric-item"><span class="metric-label">交易次数</span><span class="metric-value">{{ store.modalData.total_trades ?? '-' }}</span></div>
+                <div class="metric-item"><span class="metric-label">盈亏比</span><span class="metric-value">{{ formatNumber(store.modalData.profit_factor) }}</span></div>
+              </div>
+            </div>
+
+            <!-- Backtest in Modal -->
+            <div class="modal-backtest">
+              <h4>回测模拟</h4>
+              <div class="modal-backtest-grid">
+                <div v-if="store.modalData.backtest_7d" class="modal-bt-card">
+                  <span class="bt-period">7天</span>
+                  <span class="bt-roe" :class="{ positive: store.modalData.backtest_7d.roe > 0, negative: store.modalData.backtest_7d.roe < 0 }">{{ formatPercent(store.modalData.backtest_7d.roe) }}</span>
+                  <span class="bt-info">{{ store.modalData.backtest_7d.trade_count }}笔 | 回撤{{ formatPercent(store.modalData.backtest_7d.max_drawdown_pct ? -store.modalData.backtest_7d.max_drawdown_pct : null) }}</span>
+                </div>
+                <div v-if="store.modalData.backtest_30d" class="modal-bt-card">
+                  <span class="bt-period">30天</span>
+                  <span class="bt-roe" :class="{ positive: store.modalData.backtest_30d.roe > 0, negative: store.modalData.backtest_30d.roe < 0 }">{{ formatPercent(store.modalData.backtest_30d.roe) }}</span>
+                  <span class="bt-info">{{ store.modalData.backtest_30d.trade_count }}笔 | 回撤{{ formatPercent(store.modalData.backtest_30d.max_drawdown_pct ? -store.modalData.backtest_30d.max_drawdown_pct : null) }}</span>
+                </div>
+                <div v-if="store.modalData.backtest_90d" class="modal-bt-card">
+                  <span class="bt-period">90天</span>
+                  <span class="bt-roe" :class="{ positive: store.modalData.backtest_90d.roe > 0, negative: store.modalData.backtest_90d.roe < 0 }">{{ formatPercent(store.modalData.backtest_90d.roe) }}</span>
+                  <span class="bt-info">{{ store.modalData.backtest_90d.trade_count }}笔 | 回撤{{ formatPercent(store.modalData.backtest_90d.max_drawdown_pct ? -store.modalData.backtest_90d.max_drawdown_pct : null) }}</span>
+                </div>
+                <div v-if="store.modalData.backtest_all_time" class="modal-bt-card highlight">
+                  <span class="bt-period">全部</span>
+                  <span class="bt-roe" :class="{ positive: store.modalData.backtest_all_time.roe > 0, negative: store.modalData.backtest_all_time.roe < 0 }">{{ formatPercent(store.modalData.backtest_all_time.roe) }}</span>
+                  <span class="bt-info">{{ store.modalData.backtest_all_time.trade_count }}笔 | 回撤{{ formatPercent(store.modalData.backtest_all_time.max_drawdown_pct ? -store.modalData.backtest_all_time.max_drawdown_pct : null) }}</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Model Scores -->
+            <div v-if="store.modalData.ai_evaluation.claude_score || store.modalData.ai_evaluation.codex_score" class="modal-model-scores">
+              <h4>模型评分</h4>
+              <div class="model-scores-grid">
+                <div v-if="store.modalData.ai_evaluation.claude_score" class="model-score-item claude">
+                  <span class="model-name">Claude</span>
+                  <span class="model-score">{{ store.modalData.ai_evaluation.claude_score.toFixed(1) }}</span>
+                </div>
+                <div v-if="store.modalData.ai_evaluation.codex_score" class="model-score-item haiku">
+                  <span class="model-name">Haiku</span>
+                  <span class="model-score">{{ store.modalData.ai_evaluation.codex_score.toFixed(1) }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div v-else class="modal-no-data">
+            <p>暂无 AI 评价数据</p>
+          </div>
+        </div>
+
+        <div v-else class="modal-error">
+          <p>加载失败，请重试</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.home {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem;
+}
+
+.hero {
+  text-align: center;
+  margin-bottom: 2rem;
+}
+
+.hero h1 {
+  font-size: 2.5rem;
+  margin-bottom: 0.5rem;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.subtitle {
+  color: #888;
+  font-size: 1.1rem;
+}
+
+.input-section {
+  margin-bottom: 2rem;
+}
+
+.search-box {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.search-box > input {
+  flex: 1;
+  min-width: 300px;
+  padding: 0.75rem 1rem;
+  font-size: 1rem;
+  border: 2px solid #333;
+  border-radius: 8px;
+  background: #1a1a1a;
+  color: #fff;
+  font-family: monospace;
+}
+
+.search-box > input:focus {
+  outline: none;
+  border-color: #667eea;
+}
+
+.capital-input {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: #888;
+}
+
+.capital-input input {
+  width: 120px;
+  padding: 0.75rem;
+  border: 2px solid #333;
+  border-radius: 8px;
+  background: #1a1a1a;
+  color: #fff;
+  text-align: right;
+}
+
+.search-box button {
+  padding: 0.75rem 2rem;
+  font-size: 1rem;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: bold;
+  transition: all 0.2s;
+}
+
+.search-box button:hover:not(:disabled) {
+  transform: scale(1.02);
+}
+
+.search-box button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.search-box button.loading {
+  background: #333;
+}
+
+.error {
+  color: #f56565;
+  margin-top: 0.5rem;
+}
+
+.loading-section {
+  text-align: center;
+  padding: 3rem;
+  color: #888;
+}
+
+.spinner {
+  width: 48px;
+  height: 48px;
+  border: 4px solid #333;
+  border-top-color: #667eea;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+  margin: 0 auto 1rem;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.loading-hint {
+  color: #666;
+  font-size: 0.9rem;
+}
+
+.result-section {
+  background: #1a1a1a;
+  border-radius: 16px;
+  padding: 2rem;
+  margin-bottom: 2rem;
+}
+
+.result-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 2rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid #333;
+}
+
+.trader-info h2 {
+  font-family: monospace;
+  margin: 0 0 0.25rem 0;
+}
+
+.trader-info a {
+  color: #667eea;
+  text-decoration: none;
+  font-size: 0.9rem;
+}
+
+.account-value .label {
+  display: block;
+  color: #888;
+  font-size: 0.85rem;
+}
+
+.account-value .value {
+  font-size: 1.5rem;
+  font-weight: bold;
+}
+
+.ai-section {
+  margin-bottom: 2rem;
+}
+
+.ai-section h3, .stats-section h3, .backtest-section h3, .history-section h3 {
+  margin-bottom: 1rem;
+  color: #fff;
+}
+
+.ai-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.ai-card {
+  background: #0a0a0a;
+  padding: 1.25rem;
+  border-radius: 12px;
+  text-align: center;
+}
+
+.ai-card.score {
+  background: linear-gradient(135deg, #667eea20 0%, #764ba220 100%);
+  border: 1px solid #667eea40;
+}
+
+.ai-label {
+  display: block;
+  color: #888;
+  font-size: 0.85rem;
+  margin-bottom: 0.5rem;
+}
+
+.ai-value {
+  font-size: 1.5rem;
+  font-weight: bold;
+}
+
+.ai-max {
+  color: #666;
+  font-size: 1rem;
+}
+
+.ai-card.positive .ai-value { color: #48bb78; }
+.ai-card.negative .ai-value { color: #f56565; }
+
+.ai-reasoning {
+  background: #0a0a0a;
+  padding: 1rem;
+  border-radius: 8px;
+  color: #aaa;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+.stats-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+
+.stats-header h3 {
+  margin-bottom: 0;
+}
+
+.period-tabs {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.period-tab {
+  padding: 0.4rem 0.8rem;
+  border: 1px solid #333;
+  border-radius: 6px;
+  background: transparent;
+  color: #888;
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: all 0.2s;
+}
+
+.period-tab:hover {
+  border-color: #667eea;
+  color: #667eea;
+}
+
+.period-tab.active {
+  background: #667eea;
+  border-color: #667eea;
+  color: #fff;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 1rem;
+}
+
+.stat-card {
+  background: #0a0a0a;
+  padding: 1rem;
+  border-radius: 10px;
+}
+
+.stat-label {
+  display: block;
+  color: #888;
+  font-size: 0.8rem;
+  margin-bottom: 0.25rem;
+}
+
+.stat-value {
+  font-size: 1.25rem;
+  font-weight: bold;
+}
+
+.stat-card.positive .stat-value { color: #48bb78; }
+.stat-card.negative .stat-value { color: #f56565; }
+
+.backtest-section {
+  margin-top: 2rem;
+}
+
+.backtest-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1rem;
+}
+
+.backtest-card {
+  background: #0a0a0a;
+  padding: 1.25rem;
+  border-radius: 12px;
+  text-align: center;
+}
+
+.backtest-card.highlight {
+  background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%);
+  border: 1px solid #667eea30;
+}
+
+.backtest-card .period {
+  display: block;
+  color: #888;
+  font-size: 0.85rem;
+  margin-bottom: 0.5rem;
+}
+
+.backtest-card .bt-value {
+  display: block;
+  font-size: 1.5rem;
+  font-weight: bold;
+  margin-bottom: 0.25rem;
+}
+
+.backtest-card .bt-pnl {
+  display: block;
+  color: #888;
+  font-size: 0.85rem;
+}
+
+.backtest-card .bt-dd {
+  display: block;
+  color: #f56565;
+  font-size: 0.8rem;
+  margin-top: 0.25rem;
+}
+
+.backtest-card .bt-trades {
+  display: block;
+  color: #666;
+  font-size: 0.75rem;
+  margin-top: 0.25rem;
+}
+
+.bt-value.positive { color: #48bb78; }
+.bt-value.negative { color: #f56565; }
+
+.analyzed-time {
+  text-align: right;
+  color: #666;
+  font-size: 0.85rem;
+  margin-top: 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+}
+
+.cache-badge {
+  background: #4a5568;
+  color: #e2e8f0;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+}
+
+.refresh-btn {
+  padding: 0.25rem 0.75rem;
+  font-size: 0.8rem;
+  background: transparent;
+  border: 1px solid #667eea;
+  color: #667eea;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.refresh-btn:hover:not(:disabled) {
+  background: #667eea;
+  color: #fff;
+}
+
+.refresh-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.history-section {
+  margin-top: 2rem;
+}
+
+.history-hint {
+  font-size: 0.75rem;
+  color: #666;
+  font-weight: normal;
+}
+
+.history-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: #1a1a1a;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.history-table th,
+.history-table td {
+  padding: 0.75rem 1rem;
+  text-align: left;
+}
+
+.history-table th {
+  background: #0a0a0a;
+  color: #888;
+  font-weight: normal;
+  font-size: 0.85rem;
+}
+
+.history-table th.sortable {
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.2s;
+}
+
+.history-table th.sortable:hover {
+  color: #667eea;
+}
+
+.sort-icon {
+  margin-left: 0.25rem;
+  font-size: 0.75rem;
+  opacity: 0.7;
+}
+
+.rank-col {
+  width: 50px;
+  text-align: center;
+}
+
+.action-col {
+  width: 60px;
+  text-align: center;
+}
+
+.delete-btn {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid #444;
+  border-radius: 6px;
+  color: #888;
+  cursor: pointer;
+  font-size: 1rem;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.delete-btn:hover {
+  border-color: #f56565;
+  color: #f56565;
+  background: #f5656515;
+}
+
+.rank-badge {
+  font-size: 1.2rem;
+}
+
+.rank-num {
+  color: #666;
+  font-size: 0.9rem;
+}
+
+.history-table td {
+  border-top: 1px solid #333;
+}
+
+.history-table .address {
+  font-family: monospace;
+}
+
+.history-table tr.clickable {
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.history-table tr.clickable:hover {
+  background: #252525;
+}
+
+/* Score tier badges */
+.score-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  font-weight: bold;
+}
+
+.tier-label {
+  font-size: 0.7rem;
+  font-weight: normal;
+  opacity: 0.8;
+  margin-left: 0.25rem;
+}
+
+.tier-elite {
+  background: linear-gradient(135deg, #ffd70020 0%, #ffb30020 100%);
+  color: #ffd700;
+  border: 1px solid #ffd70040;
+}
+
+.tier-good {
+  background: #48bb7820;
+  color: #48bb78;
+  border: 1px solid #48bb7840;
+}
+
+.tier-average {
+  background: #a0aec020;
+  color: #a0aec0;
+  border: 1px solid #a0aec040;
+}
+
+.tier-low {
+  background: #f5656520;
+  color: #f56565;
+  border: 1px solid #f5656540;
+}
+
+.tier-pending {
+  background: #4a556820;
+  color: #718096;
+  border: 1px solid #4a556840;
+}
+
+/* Data freshness indicators */
+.freshness {
+  font-size: 0.85rem;
+}
+
+.freshness.fresh {
+  color: #48bb78;
+}
+
+.freshness.recent {
+  color: #a0aec0;
+}
+
+.freshness.stale {
+  color: #ed8936;
+}
+
+.freshness.very-stale {
+  color: #f56565;
+}
+
+.positive { color: #48bb78; }
+.negative { color: #f56565; }
+
+/* Trading style tags */
+.trading-tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+  padding: 0.75rem;
+  background: #0a0a0a;
+  border-radius: 8px;
+}
+
+.tags-label {
+  color: #888;
+  font-size: 0.85rem;
+}
+
+.trading-tag {
+  padding: 0.25rem 0.6rem;
+  border-radius: 12px;
+  font-size: 0.8rem;
+  font-weight: 500;
+}
+
+.trading-tag-mini {
+  padding: 0.15rem 0.4rem;
+  border-radius: 8px;
+  font-size: 0.7rem;
+  font-weight: 500;
+  margin-right: 0.25rem;
+}
+
+.tags-cell {
+  max-width: 180px;
+}
+
+/* Tag color variants */
+.tag-capital-small { background: #38a16920; color: #38a169; border: 1px solid #38a16940; }
+.tag-capital-medium { background: #3182ce20; color: #3182ce; border: 1px solid #3182ce40; }
+.tag-capital-large { background: #d6952020; color: #d69520; border: 1px solid #d6952040; }
+
+.tag-freq-high { background: #e5393520; color: #e53935; border: 1px solid #e5393540; }
+.tag-freq-medium { background: #fb8c0020; color: #fb8c00; border: 1px solid #fb8c0040; }
+.tag-freq-low { background: #43a04720; color: #43a047; border: 1px solid #43a04740; }
+
+.tag-hold-short { background: #ec407a20; color: #ec407a; border: 1px solid #ec407a40; }
+.tag-hold-medium { background: #ab47bc20; color: #ab47bc; border: 1px solid #ab47bc40; }
+.tag-hold-long { background: #5c6bc020; color: #5c6bc0; border: 1px solid #5c6bc040; }
+
+.tag-bias-long { background: #26a69a20; color: #26a69a; border: 1px solid #26a69a40; }
+.tag-bias-short { background: #ef535020; color: #ef5350; border: 1px solid #ef535040; }
+.tag-bias-balanced { background: #78909c20; color: #78909c; border: 1px solid #78909c40; }
+
+.tag-risk-aggressive { background: #ff572220; color: #ff5722; border: 1px solid #ff572240; }
+.tag-risk-stable { background: #4caf5020; color: #4caf50; border: 1px solid #4caf5040; }
+.tag-strategy-martin { background: #9c27b020; color: #9c27b0; border: 1px solid #9c27b040; }
+
+.tag-asset-major { background: #ffc10720; color: #ffc107; border: 1px solid #ffc10740; }
+.tag-asset-alt { background: #00bcd420; color: #00bcd4; border: 1px solid #00bcd440; }
+
+.tag-default { background: #60606020; color: #a0a0a0; border: 1px solid #60606040; }
+
+/* Clickable score badge */
+.clickable-score {
+  cursor: pointer;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.clickable-score:hover {
+  transform: scale(1.05);
+  box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
+}
+
+/* Modal Styles */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 1rem;
+}
+
+.modal-content {
+  background: #1a1a1a;
+  border-radius: 16px;
+  max-width: 700px;
+  width: 100%;
+  max-height: 90vh;
+  overflow-y: auto;
+  position: relative;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+
+.modal-close {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  background: transparent;
+  border: none;
+  color: #888;
+  font-size: 2rem;
+  cursor: pointer;
+  line-height: 1;
+  padding: 0.25rem 0.5rem;
+  transition: color 0.2s;
+  z-index: 10;
+}
+
+.modal-close:hover {
+  color: #fff;
+}
+
+.modal-loading {
+  padding: 4rem 2rem;
+  text-align: center;
+  color: #888;
+}
+
+.modal-body {
+  padding: 2rem;
+}
+
+.modal-header {
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid #333;
+}
+
+.modal-header h2 {
+  margin: 0 0 0.5rem 0;
+  font-size: 1.5rem;
+}
+
+.address-link {
+  color: #667eea;
+  text-decoration: none;
+  font-family: monospace;
+  font-size: 0.9rem;
+}
+
+.address-link:hover {
+  text-decoration: underline;
+}
+
+/* Score Row */
+.modal-score-row {
+  display: flex;
+  gap: 2rem;
+  align-items: center;
+  margin-bottom: 1.5rem;
+}
+
+.modal-score-card {
+  background: linear-gradient(135deg, #667eea20 0%, #764ba220 100%);
+  border: 1px solid #667eea40;
+  border-radius: 12px;
+  padding: 1.5rem 2rem;
+  text-align: center;
+}
+
+.score-label {
+  display: block;
+  color: #888;
+  font-size: 0.85rem;
+  margin-bottom: 0.5rem;
+}
+
+.score-value {
+  display: block;
+  font-size: 3rem;
+  font-weight: bold;
+  line-height: 1;
+}
+
+.score-tier {
+  display: block;
+  color: #888;
+  font-size: 0.85rem;
+  margin-top: 0.5rem;
+}
+
+.modal-meta {
+  flex: 1;
+}
+
+.meta-item {
+  margin-bottom: 0.75rem;
+}
+
+.meta-label {
+  display: block;
+  color: #888;
+  font-size: 0.8rem;
+}
+
+.meta-value {
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+/* Modal Tags */
+.modal-tags {
+  margin-bottom: 1.5rem;
+}
+
+.tags-title {
+  display: block;
+  color: #888;
+  font-size: 0.85rem;
+  margin-bottom: 0.5rem;
+}
+
+.tags-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+/* Reasoning Section */
+.modal-reasoning {
+  margin-bottom: 1.5rem;
+}
+
+.modal-reasoning h4 {
+  color: #fff;
+  font-size: 1rem;
+  margin-bottom: 1rem;
+}
+
+.reasoning-content {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.reasoning-block {
+  background: #0a0a0a;
+  border-radius: 10px;
+  padding: 1rem;
+  border-left: 3px solid #667eea;
+}
+
+.reasoning-block.claude {
+  border-left-color: #667eea;
+}
+
+.reasoning-block.haiku {
+  border-left-color: #48bb78;
+}
+
+.reasoning-block.codex {
+  border-left-color: #f6ad55;
+}
+
+.reasoning-block.fallback {
+  border-left-color: #a0aec0;
+}
+
+.model-badge {
+  display: inline-block;
+  background: #ffffff10;
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  color: #888;
+  margin-bottom: 0.5rem;
+}
+
+.reasoning-block p {
+  margin: 0;
+  color: #ccc;
+  line-height: 1.6;
+  font-size: 0.95rem;
+}
+
+/* Metrics Grid */
+.modal-metrics {
+  margin-bottom: 1.5rem;
+}
+
+.modal-metrics h4 {
+  color: #fff;
+  font-size: 1rem;
+  margin-bottom: 1rem;
+}
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.75rem;
+}
+
+.metric-item {
+  background: #0a0a0a;
+  padding: 0.75rem;
+  border-radius: 8px;
+  text-align: center;
+}
+
+.metric-label {
+  display: block;
+  color: #888;
+  font-size: 0.75rem;
+  margin-bottom: 0.25rem;
+}
+
+.metric-value {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+/* Modal Backtest */
+.modal-backtest {
+  margin-bottom: 1.5rem;
+}
+
+.modal-backtest h4 {
+  color: #fff;
+  font-size: 1rem;
+  margin-bottom: 1rem;
+}
+
+.modal-backtest-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.75rem;
+}
+
+.modal-bt-card {
+  background: #0a0a0a;
+  padding: 0.75rem;
+  border-radius: 8px;
+  text-align: center;
+}
+
+.modal-bt-card.highlight {
+  background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%);
+  border: 1px solid #667eea30;
+}
+
+.modal-bt-card .bt-period {
+  display: block;
+  color: #888;
+  font-size: 0.75rem;
+  margin-bottom: 0.25rem;
+}
+
+.modal-bt-card .bt-roe {
+  display: block;
+  font-size: 1.1rem;
+  font-weight: bold;
+}
+
+.modal-bt-card .bt-info {
+  display: block;
+  color: #666;
+  font-size: 0.7rem;
+  margin-top: 0.25rem;
+}
+
+/* Model Scores */
+.modal-model-scores h4 {
+  color: #fff;
+  font-size: 1rem;
+  margin-bottom: 1rem;
+}
+
+.model-scores-grid {
+  display: flex;
+  gap: 1rem;
+}
+
+.model-score-item {
+  flex: 1;
+  background: #0a0a0a;
+  padding: 1rem;
+  border-radius: 10px;
+  text-align: center;
+  border: 1px solid #333;
+}
+
+.model-score-item.claude {
+  border-color: #667eea40;
+}
+
+.model-score-item.haiku {
+  border-color: #48bb7840;
+}
+
+.model-name {
+  display: block;
+  color: #888;
+  font-size: 0.8rem;
+  margin-bottom: 0.25rem;
+}
+
+.model-score {
+  font-size: 1.5rem;
+  font-weight: bold;
+}
+
+.model-score-item.claude .model-score {
+  color: #667eea;
+}
+
+.model-score-item.haiku .model-score {
+  color: #48bb78;
+}
+
+.modal-no-data,
+.modal-error {
+  padding: 3rem;
+  text-align: center;
+  color: #888;
+}
+
+@media (max-width: 768px) {
+  .search-box {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .search-box > input {
+    min-width: auto;
+  }
+  .capital-input {
+    justify-content: center;
+  }
+  .ai-grid, .backtest-grid {
+    grid-template-columns: 1fr;
+  }
+  .result-header {
+    flex-direction: column;
+    gap: 1rem;
+    text-align: center;
+  }
+  .history-table {
+    font-size: 0.85rem;
+  }
+}
+</style>
